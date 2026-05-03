@@ -16,7 +16,7 @@ jobs:
           node-version: '20'
           
       - name: Install dependencies
-        run: npm install playwright @supabase/supabase-js
+        run: npm install playwright @supabase/supabase-js p-limit
         
       - name: Install Playwright Browser
         run: npx playwright install chromium
