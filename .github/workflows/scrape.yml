@@ -1,0 +1,29 @@
+name: Hourly Retailer Scrape
+on:
+  schedule:
+    - cron: '0 * * * *' # This runs it every hour on the dot
+  workflow_dispatch: # This adds the "Run workflow" button so you can test it manually
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Install dependencies
+        run: npm install playwright @supabase/supabase-js
+        
+      - name: Install Playwright Browser
+        run: npx playwright install chromium
+        
+      - name: Run Scraper
+        run: node scraper.js
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          EARNKARO_COOKIE_STRING: ${{ secrets.EARNKARO_COOKIE_STRING }}
