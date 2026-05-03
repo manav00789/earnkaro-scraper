@@ -1,7 +1,7 @@
 /**
- * CacheKaro scraper - Auth.json Edition
+ * CacheKaro scraper - Stealth Auth Edition
  * ---------------------------------------------------------------
- * This version uses the 'auth.json' session file to bypass OTP.
+ * Uses 'auth.json' with advanced evasion to bypass bot detection.
  */
 
 import { chromium } from "playwright";
@@ -27,7 +27,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const BUCKET = "retailer-snapshots";
-const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const today = new Date().toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
 const concurrency = Math.max(1, Number(CONCURRENCY));
 
@@ -50,7 +50,7 @@ async function withRetry(label, fn, attempts = 3) {
     } catch (err) {
       lastErr = err;
       console.warn(`[retry ${i}/${attempts}] ${label}: ${err.message}`);
-      await new Promise((r) => setTimeout(r, 1500 * i));
+      await new Promise((r) => setTimeout(r, 2000 * i));
     }
   }
   throw lastErr;
@@ -62,36 +62,43 @@ async function discoverRetailers(context) {
   const page = await context.newPage();
   page.setDefaultTimeout(pageTimeout);
 
-  console.log(`Discovering retailers from ${START_URL}`);
+  console.log(`Navigating to: ${START_URL}`);
   
-  // Navigate to stores
+  // Navigate with a more patient wait strategy
   await page.goto(START_URL, { waitUntil: "networkidle" });
 
-  // Wait for the grid to appear - if this fails, auth.json is likely expired
+  // Wait for the grid or specific card elements
   try {
-    await page.waitForSelector('.store-card, .store-box, a[href*="/stores/"]', { timeout: 15000 });
+    await page.waitForSelector('.store-card, .store-box, a[href*="/stores/"]', { timeout: 20000 });
   } catch (e) {
-    console.error("FAILED: Store grid not found. Your auth.json might be expired.");
-    const currentUrl = page.url();
-    console.log(`Current Page URL: ${currentUrl}`);
-    if (currentUrl.includes('/login')) {
-      throw new Error("Redirected to Login. Please refresh auth.json locally.");
+    console.error("CRITICAL: Store grid not found.");
+    console.log(`Final URL reached: ${page.url()}`);
+    
+    // Take a debug screenshot to see what the bot sees (Auth error vs Bot Block)
+    const debugBuf = await page.screenshot({ fullPage: true });
+    await fs.writeFileSync('debug_error.png', debugBuf);
+    console.log("Debug screenshot saved as debug_error.png");
+    
+    if (page.url().includes('/login')) {
+      throw new Error("Session Expired: Redirected to Login. Update auth.json.");
     }
+    throw new Error("Bot Blocked: The grid failed to load despite being on the correct URL.");
   }
 
-  // Auto-scroll for lazy loading
+  // Human-like scrolling
   await page.evaluate(async () => {
     await new Promise((resolve) => {
-      let total = 0;
-      const step = 800;
+      let totalHeight = 0;
+      const distance = 400;
       const timer = setInterval(() => {
-        window.scrollBy(0, step);
-        total += step;
-        if (total >= document.body.scrollHeight) {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, distance);
+        totalHeight += distance;
+        if (totalHeight >= scrollHeight) {
           clearInterval(timer);
           resolve();
         }
-      }, 200);
+      }, 300);
     });
   });
 
@@ -116,7 +123,7 @@ async function discoverRetailers(context) {
   });
 
   await page.close();
-  console.log(`Discovered ${retailers.length} retailer links`);
+  console.log(`Successfully discovered ${retailers.length} retailers.`);
   return retailers;
 }
 
@@ -125,21 +132,16 @@ async function discoverRetailers(context) {
 async function captureRetailer(context, retailer) {
   const slug = slugify(retailer.name);
   const page = await context.newPage();
-  page.setDefaultTimeout(pageTimeout);
-
+  
   try {
-    await withRetry(`goto ${retailer.url}`, () =>
-      page.goto(retailer.url, { waitUntil: "networkidle" })
-    );
+    await withRetry(`Capture: ${retailer.name}`, async () => {
+      await page.goto(retailer.url, { waitUntil: "networkidle" });
+      await page.waitForTimeout(3000); // Wait for images to load
+      
+      const buffer = await page.screenshot({ fullPage: true, type: "png" });
 
-    await page.waitForTimeout(2000); 
-
-    const buffer = await page.screenshot({ fullPage: true, type: "png" });
-
-    const primaryPath = `${slug}/${today}.png`;
-    const browsePath = `${today}/${slug}.png`;
-
-    await withRetry(`upload ${primaryPath}`, async () => {
+      const primaryPath = `${slug}/${today}.png`;
+      
       const { error } = await supabase.storage
         .from(BUCKET)
         .upload(primaryPath, buffer, {
@@ -147,66 +149,61 @@ async function captureRetailer(context, retailer) {
           upsert: true,
         });
       if (error) throw error;
-    });
 
-    await supabase.storage
-      .from(BUCKET)
-      .upload(browsePath, buffer, { contentType: "image/png", upsert: true })
-      .catch(() => {});
-
-    const { error: insertErr } = await supabase.from("snapshots").upsert(
-      {
+      await supabase.from("snapshots").upsert({
         retailer_name: retailer.name,
         retailer_slug: slug,
         image_path: primaryPath,
         captured_on: today,
-      },
-      { onConflict: "retailer_slug,captured_on" }
-    );
-    if (insertErr) throw insertErr;
+      }, { onConflict: "retailer_slug,captured_on" });
 
-    const { error: updErr } = await supabase
-      .from("retailers")
-      .update({ last_capture_at: new Date().toISOString() })
-      .eq("slug", slug);
-    
-    console.log(`✓ ${retailer.name} -> ${primaryPath}`);
-    return { ok: true, slug };
+      await supabase.from("retailers").update({ 
+        last_capture_at: new Date().toISOString() 
+      }).eq("slug", slug);
+    });
+
+    console.log(`✓ Captured: ${retailer.name}`);
+    return { ok: true };
   } catch (err) {
-    console.error(`✗ ${retailer.name}: ${err.message}`);
-    return { ok: false, slug, error: err.message };
+    console.error(`✗ Failed ${retailer.name}: ${err.message}`);
+    return { ok: false };
   } finally {
-    await page.close().catch(() => {});
+    await page.close();
   }
 }
 
 // ---- main ----------------------------------------------------------------
 
 async function main() {
-  // Check if auth.json exists in the root
   if (!fs.existsSync('auth.json')) {
-    throw new Error("Missing auth.json file! Please upload it to the repository.");
+    throw new Error("File 'auth.json' not found in root directory.");
   }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ 
+    headless: true,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox'
+    ]
+  });
   
-  // LOAD SESSION FROM FILE
   const context = await browser.newContext({
     storageState: 'auth.json',
-    viewport: { width: 1440, height: 900 },
+    viewport: { width: 1920, height: 1080 },
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  });
+
+  // Stealth: Hide automation flags
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
   try {
     let retailers = await discoverRetailers(context);
     
     if (MAX_RETAILERS) {
-      console.log(`Capping run to ${MAX_RETAILERS} retailers (test mode)`);
       retailers = retailers.slice(0, Number(MAX_RETAILERS));
-    }
-
-    if (retailers.length === 0) {
-      throw new Error("No retailers discovered. Check if the page loaded correctly.");
     }
 
     const limit = pLimit(concurrency);
@@ -215,10 +212,9 @@ async function main() {
     );
 
     const ok = results.filter((r) => r.ok).length;
-    const failed = results.length - ok;
-    console.log(`\nDone. ${ok} succeeded, ${failed} failed (of ${results.length}).`);
+    console.log(`\nJob finished: ${ok}/${results.length} retailers processed.`);
     
-    if (failed > 0) process.exitCode = 1;
+    if (ok === 0) process.exitCode = 1;
   } finally {
     await context.close();
     await browser.close();
@@ -226,6 +222,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Fatal:", err);
+  console.error("Fatal Script Error:", err);
   process.exit(1);
 });
