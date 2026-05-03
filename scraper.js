@@ -1,17 +1,17 @@
 /**
- * CacheKaro scraper - Updated for improved store discovery
+ * CacheKaro scraper - Auth.json Edition
  * ---------------------------------------------------------------
- * Standalone Node.js script designed to run on GitHub Actions.
+ * This version uses the 'auth.json' session file to bypass OTP.
  */
 
 import { chromium } from "playwright";
 import { createClient } from "@supabase/supabase-js";
 import pLimit from "p-limit";
+import fs from "fs";
 
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  EARNKARO_COOKIE_STRING,
   CONCURRENCY = "4",
   PAGE_TIMEOUT_MS = "45000",
   MAX_RETAILERS,
@@ -20,9 +20,6 @@ const {
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-}
-if (!EARNKARO_COOKIE_STRING) {
-  throw new Error("Missing EARNKARO_COOKIE_STRING");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -43,27 +40,6 @@ function slugify(input) {
     .replace(/&/g, "and")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-}
-
-function parseCookieString(cookieString, domain = ".earnkaro.com") {
-  return cookieString
-    .split(";")
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((pair) => {
-      const idx = pair.indexOf("=");
-      const name = pair.slice(0, idx).trim();
-      const value = pair.slice(idx + 1).trim();
-      return {
-        name,
-        value,
-        domain,
-        path: "/",
-        httpOnly: false,
-        secure: true,
-        sameSite: "Lax",
-      };
-    });
 }
 
 async function withRetry(label, fn, attempts = 3) {
@@ -87,16 +63,23 @@ async function discoverRetailers(context) {
   page.setDefaultTimeout(pageTimeout);
 
   console.log(`Discovering retailers from ${START_URL}`);
+  
+  // Navigate to stores
   await page.goto(START_URL, { waitUntil: "networkidle" });
 
-  // Wait for the grid container to ensure content is present
+  // Wait for the grid to appear - if this fails, auth.json is likely expired
   try {
-    await page.waitForSelector('a[href*="/stores/"], .store-card, .store-box', { timeout: 15000 });
+    await page.waitForSelector('.store-card, .store-box, a[href*="/stores/"]', { timeout: 15000 });
   } catch (e) {
-    console.warn("Timeout waiting for store selectors; attempting to scrape anyway.");
+    console.error("FAILED: Store grid not found. Your auth.json might be expired.");
+    const currentUrl = page.url();
+    console.log(`Current Page URL: ${currentUrl}`);
+    if (currentUrl.includes('/login')) {
+      throw new Error("Redirected to Login. Please refresh auth.json locally.");
+    }
   }
 
-  // Auto-scroll to trigger lazy loading
+  // Auto-scroll for lazy loading
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let total = 0;
@@ -114,7 +97,6 @@ async function discoverRetailers(context) {
 
   const retailers = await page.evaluate(() => {
     const out = new Map();
-    // Broad selector to capture cards or direct links
     const elements = document.querySelectorAll('a[href*="/stores/"], .store-card, .store-box');
     
     elements.forEach((el) => {
@@ -124,7 +106,6 @@ async function discoverRetailers(context) {
       const href = anchor.getAttribute("href");
       if (!href || /\/stores\/?$/.test(href) || href.includes('all-stores')) return;
 
-      // Clean name extraction: ignore profit percentage lines
       const name = anchor.innerText.split('\n').map(t => t.trim()).find(t => t.length > 0);
       if (!name) return;
 
@@ -151,7 +132,7 @@ async function captureRetailer(context, retailer) {
       page.goto(retailer.url, { waitUntil: "networkidle" })
     );
 
-    await page.waitForTimeout(2000); // Wait for animations/lazy elements
+    await page.waitForTimeout(2000); 
 
     const buffer = await page.screenshot({ fullPage: true, type: "png" });
 
@@ -188,8 +169,7 @@ async function captureRetailer(context, retailer) {
       .from("retailers")
       .update({ last_capture_at: new Date().toISOString() })
       .eq("slug", slug);
-    if (updErr) console.warn(`retailers update failed for ${slug}: ${updErr.message}`);
-
+    
     console.log(`✓ ${retailer.name} -> ${primaryPath}`);
     return { ok: true, slug };
   } catch (err) {
@@ -203,20 +183,31 @@ async function captureRetailer(context, retailer) {
 // ---- main ----------------------------------------------------------------
 
 async function main() {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
-    deviceScaleFactor: 1,
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-  });
+  // Check if auth.json exists in the root
+  if (!fs.existsSync('auth.json')) {
+    throw new Error("Missing auth.json file! Please upload it to the repository.");
+  }
 
-  await context.addCookies(parseCookieString(EARNKARO_COOKIE_STRING));
+  const browser = await chromium.launch({ headless: true });
+  
+  // LOAD SESSION FROM FILE
+  const context = await browser.newContext({
+    storageState: 'auth.json',
+    viewport: { width: 1440, height: 900 },
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  });
 
   try {
     let retailers = await discoverRetailers(context);
-    if (MAX_RETAILERS) retailers = retailers.slice(0, Number(MAX_RETAILERS));
-    if (retailers.length === 0) throw new Error("No retailers discovered — check cookie/auth");
+    
+    if (MAX_RETAILERS) {
+      console.log(`Capping run to ${MAX_RETAILERS} retailers (test mode)`);
+      retailers = retailers.slice(0, Number(MAX_RETAILERS));
+    }
+
+    if (retailers.length === 0) {
+      throw new Error("No retailers discovered. Check if the page loaded correctly.");
+    }
 
     const limit = pLimit(concurrency);
     const results = await Promise.all(
@@ -226,6 +217,7 @@ async function main() {
     const ok = results.filter((r) => r.ok).length;
     const failed = results.length - ok;
     console.log(`\nDone. ${ok} succeeded, ${failed} failed (of ${results.length}).`);
+    
     if (failed > 0) process.exitCode = 1;
   } finally {
     await context.close();
