@@ -1,7 +1,7 @@
 /**
- * CacheKaro scraper - Stealth Auth Edition
+ * CacheKaro scraper - Advanced Stealth Edition
  * ---------------------------------------------------------------
- * Uses 'auth.json' with advanced evasion to bypass bot detection.
+ * Uses 'auth.json' with human-mimicry delays and header spoofing.
  */
 
 import { chromium } from "playwright";
@@ -13,7 +13,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   CONCURRENCY = "4",
-  PAGE_TIMEOUT_MS = "45000",
+  PAGE_TIMEOUT_MS = "60000",
   MAX_RETAILERS,
   START_URL = "https://earnkaro.com/stores",
 } = process.env;
@@ -31,7 +31,8 @@ const today = new Date().toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
 const concurrency = Math.max(1, Number(CONCURRENCY));
 
-// ---- helpers -------------------------------------------------------------
+// Utility for human-like pauses
+const delay = (ms) => new Promise(res => setTimeout(res, ms));
 
 function slugify(input) {
   return input
@@ -50,7 +51,7 @@ async function withRetry(label, fn, attempts = 3) {
     } catch (err) {
       lastErr = err;
       console.warn(`[retry ${i}/${attempts}] ${label}: ${err.message}`);
-      await new Promise((r) => setTimeout(r, 2000 * i));
+      await delay(2000 * i);
     }
   }
   throw lastErr;
@@ -60,36 +61,43 @@ async function withRetry(label, fn, attempts = 3) {
 
 async function discoverRetailers(context) {
   const page = await context.newPage();
-  page.setDefaultTimeout(pageTimeout);
+  
+  // Set headers to look like a standard Windows browser
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://earnkaro.com/'
+  });
 
   console.log(`Navigating to: ${START_URL}`);
   
-  // Navigate with a more patient wait strategy
-  await page.goto(START_URL, { waitUntil: "networkidle" });
+  // Use 'domcontentloaded' to avoid waiting for every tracking pixel
+  await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
+  
+  // Random human-like delay before acting
+  await delay(Math.floor(Math.random() * 3000) + 4000);
 
-  // Wait for the grid or specific card elements
   try {
-    await page.waitForSelector('.store-card, .store-box, a[href*="/stores/"]', { timeout: 20000 });
+    // Look for store images or card containers
+    await page.waitForSelector('img[src*="retailer"], .store-card, a[href*="/stores/"]', { timeout: 30000 });
   } catch (e) {
     console.error("CRITICAL: Store grid not found.");
-    console.log(`Final URL reached: ${page.url()}`);
+    console.log(`Final URL: ${page.url()}`);
     
-    // Take a debug screenshot to see what the bot sees (Auth error vs Bot Block)
     const debugBuf = await page.screenshot({ fullPage: true });
-    await fs.writeFileSync('debug_error.png', debugBuf);
+    fs.writeFileSync('debug_error.png', debugBuf);
     console.log("Debug screenshot saved as debug_error.png");
     
     if (page.url().includes('/login')) {
-      throw new Error("Session Expired: Redirected to Login. Update auth.json.");
+      throw new Error("Session Expired: Redirected to Login. Refresh auth.json.");
     }
     throw new Error("Bot Blocked: The grid failed to load despite being on the correct URL.");
   }
 
-  // Human-like scrolling
+  // Smooth scrolling to trigger lazy loading
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let totalHeight = 0;
-      const distance = 400;
+      const distance = 500;
       const timer = setInterval(() => {
         const scrollHeight = document.body.scrollHeight;
         window.scrollBy(0, distance);
@@ -98,18 +106,15 @@ async function discoverRetailers(context) {
           clearInterval(timer);
           resolve();
         }
-      }, 300);
+      }, 400);
     });
   });
 
   const retailers = await page.evaluate(() => {
     const out = new Map();
-    const elements = document.querySelectorAll('a[href*="/stores/"], .store-card, .store-box');
+    const elements = document.querySelectorAll('a[href*="/stores/"]');
     
-    elements.forEach((el) => {
-      const anchor = el.tagName === 'A' ? el : el.querySelector('a');
-      if (!anchor) return;
-
+    elements.forEach((anchor) => {
       const href = anchor.getAttribute("href");
       if (!href || /\/stores\/?$/.test(href) || href.includes('all-stores')) return;
 
@@ -123,11 +128,11 @@ async function discoverRetailers(context) {
   });
 
   await page.close();
-  console.log(`Successfully discovered ${retailers.length} retailers.`);
+  console.log(`Found ${retailers.length} retailers.`);
   return retailers;
 }
 
-// ---- per-retailer worker -------------------------------------------------
+// ---- worker --------------------------------------------------------------
 
 async function captureRetailer(context, retailer) {
   const slug = slugify(retailer.name);
@@ -135,20 +140,16 @@ async function captureRetailer(context, retailer) {
   
   try {
     await withRetry(`Capture: ${retailer.name}`, async () => {
-      await page.goto(retailer.url, { waitUntil: "networkidle" });
-      await page.waitForTimeout(3000); // Wait for images to load
+      await page.goto(retailer.url, { waitUntil: "domcontentloaded" });
+      await delay(3000); 
       
       const buffer = await page.screenshot({ fullPage: true, type: "png" });
-
       const primaryPath = `${slug}/${today}.png`;
       
-      const { error } = await supabase.storage
+      const { error: storageErr } = await supabase.storage
         .from(BUCKET)
-        .upload(primaryPath, buffer, {
-          contentType: "image/png",
-          upsert: true,
-        });
-      if (error) throw error;
+        .upload(primaryPath, buffer, { contentType: "image/png", upsert: true });
+      if (storageErr) throw storageErr;
 
       await supabase.from("snapshots").upsert({
         retailer_name: retailer.name,
@@ -156,16 +157,12 @@ async function captureRetailer(context, retailer) {
         image_path: primaryPath,
         captured_on: today,
       }, { onConflict: "retailer_slug,captured_on" });
-
-      await supabase.from("retailers").update({ 
-        last_capture_at: new Date().toISOString() 
-      }).eq("slug", slug);
     });
 
-    console.log(`✓ Captured: ${retailer.name}`);
+    console.log(`✓ ${retailer.name}`);
     return { ok: true };
   } catch (err) {
-    console.error(`✗ Failed ${retailer.name}: ${err.message}`);
+    console.error(`✗ ${retailer.name}: ${err.message}`);
     return { ok: false };
   } finally {
     await page.close();
@@ -176,16 +173,12 @@ async function captureRetailer(context, retailer) {
 
 async function main() {
   if (!fs.existsSync('auth.json')) {
-    throw new Error("File 'auth.json' not found in root directory.");
+    throw new Error("Missing auth.json in root directory.");
   }
 
   const browser = await chromium.launch({ 
     headless: true,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox'
-    ]
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox']
   });
   
   const context = await browser.newContext({
@@ -194,27 +187,18 @@ async function main() {
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   });
 
-  // Stealth: Hide automation flags
+  // Hide the navigator.webdriver flag
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
   try {
     let retailers = await discoverRetailers(context);
-    
-    if (MAX_RETAILERS) {
-      retailers = retailers.slice(0, Number(MAX_RETAILERS));
-    }
+    if (MAX_RETAILERS) retailers = retailers.slice(0, Number(MAX_RETAILERS));
 
     const limit = pLimit(concurrency);
-    const results = await Promise.all(
-      retailers.map((r) => limit(() => captureRetailer(context, r)))
-    );
+    await Promise.all(retailers.map((r) => limit(() => captureRetailer(context, r))));
 
-    const ok = results.filter((r) => r.ok).length;
-    console.log(`\nJob finished: ${ok}/${results.length} retailers processed.`);
-    
-    if (ok === 0) process.exitCode = 1;
   } finally {
     await context.close();
     await browser.close();
@@ -222,6 +206,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Fatal Script Error:", err);
+  console.error("Fatal Error:", err);
   process.exit(1);
 });
