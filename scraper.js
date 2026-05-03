@@ -1,27 +1,7 @@
 /**
- * CacheKaro scraper
+ * CacheKaro scraper - Updated for improved store discovery
  * ---------------------------------------------------------------
  * Standalone Node.js script designed to run on GitHub Actions.
- *
- * What it does:
- *  1. Loads the EarnKaro session cookie from EARNKARO_COOKIE_STRING.
- *  2. Visits https://earnkaro.com/stores and discovers every retailer link.
- *  3. For each retailer, opens the store page and takes a full-page PNG screenshot.
- *  4. Uploads the screenshot to the Supabase `retailer-snapshots` bucket
- *     at path `{retailer-slug}/{YYYY-MM-DD}.png` (matches the dashboard reader).
- *     Also writes a date-keyed copy `{YYYY-MM-DD}/{retailer-slug}.png` for browsing.
- *  5. Inserts a row in the `snapshots` table and updates `retailers.last_capture_at`.
- *
- * Required env vars:
- *   SUPABASE_URL                  e.g. https://xxxx.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY     service role key (NEVER expose client-side)
- *   EARNKARO_COOKIE_STRING        full cookie header from a logged-in browser
- *
- * Optional env vars:
- *   CONCURRENCY=4                 parallel browser contexts (default 4)
- *   PAGE_TIMEOUT_MS=45000         per-page navigation timeout
- *   MAX_RETAILERS=                cap for testing (e.g. 5)
- *   START_URL=https://earnkaro.com/stores
  */
 
 import { chromium } from "playwright";
@@ -65,7 +45,6 @@ function slugify(input) {
     .replace(/^-+|-+$/g, "");
 }
 
-/** Parse "k=v; k2=v2" into Playwright cookie objects scoped to earnkaro.com */
 function parseCookieString(cookieString, domain = ".earnkaro.com") {
   return cookieString
     .split(";")
@@ -110,6 +89,13 @@ async function discoverRetailers(context) {
   console.log(`Discovering retailers from ${START_URL}`);
   await page.goto(START_URL, { waitUntil: "networkidle" });
 
+  // Wait for the grid container to ensure content is present
+  try {
+    await page.waitForSelector('a[href*="/stores/"], .store-card, .store-box', { timeout: 15000 });
+  } catch (e) {
+    console.warn("Timeout waiting for store selectors; attempting to scrape anyway.");
+  }
+
   // Auto-scroll to trigger lazy loading
   await page.evaluate(async () => {
     await new Promise((resolve) => {
@@ -128,14 +114,20 @@ async function discoverRetailers(context) {
 
   const retailers = await page.evaluate(() => {
     const out = new Map();
-    const anchors = document.querySelectorAll('a[href*="/stores/"], a[href*="/store/"]');
-    anchors.forEach((a) => {
-      const href = a.getAttribute("href");
-      if (!href) return;
-      // Skip the index page itself
-      if (/\/stores\/?$/.test(href)) return;
-      const name = (a.innerText || a.textContent || "").trim().split("\n")[0];
+    // Broad selector to capture cards or direct links
+    const elements = document.querySelectorAll('a[href*="/stores/"], .store-card, .store-box');
+    
+    elements.forEach((el) => {
+      const anchor = el.tagName === 'A' ? el : el.querySelector('a');
+      if (!anchor) return;
+
+      const href = anchor.getAttribute("href");
+      if (!href || /\/stores\/?$/.test(href) || href.includes('all-stores')) return;
+
+      // Clean name extraction: ignore profit percentage lines
+      const name = anchor.innerText.split('\n').map(t => t.trim()).find(t => t.length > 0);
       if (!name) return;
+
       const url = new URL(href, location.origin).toString();
       if (!out.has(url)) out.set(url, { name, url });
     });
@@ -159,8 +151,7 @@ async function captureRetailer(context, retailer) {
       page.goto(retailer.url, { waitUntil: "networkidle" })
     );
 
-    // Give lazy content a moment
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000); // Wait for animations/lazy elements
 
     const buffer = await page.screenshot({ fullPage: true, type: "png" });
 
@@ -177,7 +168,6 @@ async function captureRetailer(context, retailer) {
       if (error) throw error;
     });
 
-    // Best-effort second copy for date-browsing layouts
     await supabase.storage
       .from(BUCKET)
       .upload(browsePath, buffer, { contentType: "image/png", upsert: true })
@@ -221,7 +211,6 @@ async function main() {
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
 
-  // Inject auth cookies BEFORE any navigation
   await context.addCookies(parseCookieString(EARNKARO_COOKIE_STRING));
 
   try {
