@@ -1,9 +1,9 @@
-name: Hourly Retailer Scrape
+name: Daily Retailer Scrape
 
 on:
   schedule:
-    - cron: '0 * * * *'   # every hour on the dot
-  workflow_dispatch:        # manual "Run workflow" button
+    - cron: '0 2 * * *'   # 2:00 AM UTC = 7:30 AM IST
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -17,13 +17,15 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        run: npm install playwright @supabase/supabase-js p-limit ws
-        #                                                         ^^^ added ws for Node 20
+      # canvas package needs these system libs
+      - name: Install system dependencies for canvas
+        run: sudo apt-get install -y build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
 
-      - name: Install Playwright Browser + system deps
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Install Playwright Browser
         run: npx playwright install chromium --with-deps
-        #                                    ^^^^^^^^^^^ critical: installs OS libs needed in CI
 
       - name: Run Scraper
         run: node scraper.js
@@ -33,11 +35,10 @@ jobs:
           EARNKARO_EMAIL: ${{ secrets.EARNKARO_EMAIL }}
           EARNKARO_PASSWORD: ${{ secrets.EARNKARO_PASSWORD }}
 
-      # Saves screenshot on failure so you can download and debug
-      - name: Upload debug screenshot on failure
-        if: failure()
+      - name: Upload debug screenshots
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshot
-          path: debug_discover.png
-          retention-days: 3
+          name: debug-screenshots
+          path: debug_*.png
+          retention-days: 7
