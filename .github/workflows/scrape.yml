@@ -30,7 +30,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          EARNKARO_COOKIE_STRING: ${{ secrets.EARNKARO_COOKIE_STRING }}
+          EARNKARO_EMAIL: ${{ secrets.EARNKARO_EMAIL }}
+          EARNKARO_PASSWORD: ${{ secrets.EARNKARO_PASSWORD }}
 
       # Saves screenshot on failure so you can download and debug
       - name: Upload debug screenshot on failure
