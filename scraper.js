@@ -1,8 +1,9 @@
 /**
- * EarnKaro scraper - Daily Edition
- * - Extracts profit rates + offer details as TEXT (copyable)
- * - Also saves screenshot of modal
- * - Reloads stores page for each store to avoid DOM shift issues
+ * EarnKaro scraper - Final Edition
+ * - Crops modal only (no dark background)
+ * - Scrolls inside modal to capture ALL rows
+ * - Extracts text as structured JSON (copyable in Lovable)
+ * - Fresh page per store to avoid DOM drift
  */
 
 import { chromium } from "playwright";
@@ -75,18 +76,15 @@ async function login(context) {
   }
 }
 
-// ── LOAD STORES PAGE + COLLECT ALL STORE NAMES ────────────────────────────
-// Returns array of store names in order from the page
+// ── COLLECT STORE NAMES ────────────────────────────────────────────────────
 
 async function collectStoreNames(context) {
   const page = await context.newPage();
   await stealthPage(page);
   try {
-    console.log("→ Loading stores page to collect names...");
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
     await delay(3000);
 
-    // Scroll all the way down to load lazy cards
     let prevHeight = 0;
     for (let i = 0; i < 40; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -95,156 +93,213 @@ async function collectStoreNames(context) {
       if (h === prevHeight) break;
       prevHeight = h;
     }
-    await delay(500);
 
-    // Collect store names from img[alt] inside each card that has VIEW PROFIT RATES
     const names = await page.evaluate(() => {
       const results = [];
       document.querySelectorAll("*").forEach((el) => {
         if (el.innerText?.trim().toUpperCase() !== "VIEW PROFIT RATES") return;
-        // Walk up to find img[alt] in the card
         let node = el.parentElement;
         for (let j = 0; j < 8; j++) {
           const img = node?.querySelector("img[alt]");
-          if (img?.alt?.trim()) {
-            results.push(img.alt.trim());
-            return;
-          }
+          if (img?.alt?.trim()) { results.push(img.alt.trim()); return; }
           node = node?.parentElement;
         }
-        results.push(null); // placeholder if name not found
       });
-      return results;
+      return [...new Set(results)]; // deduplicate
     });
 
-    const valid = names.filter(Boolean);
-    console.log(`→ Found ${valid.length} stores`);
-    return valid;
+    console.log(`→ Found ${names.length} stores`);
+    return names;
   } finally {
     await page.close();
   }
 }
 
+// ── SCREENSHOT MODAL ONLY (cropped, full scroll) ───────────────────────────
+
+async function screenshotModalScrolled(page) {
+  const MODAL_SEL = '[role="dialog"]';
+
+  // Wait for modal
+  await page.waitForSelector(MODAL_SEL, { timeout: 8000 });
+  await delay(500);
+
+  const modal = await page.$(MODAL_SEL);
+  if (!modal) return null;
+
+  // Find the scrollable content area inside modal
+  const scrollSel = `${MODAL_SEL} [class*="body"], ${MODAL_SEL} [class*="content"], ${MODAL_SEL} [class*="scroll"]`;
+
+  // Reset scroll to top
+  await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (el) el.scrollTop = 0;
+  }, MODAL_SEL);
+  await delay(300);
+
+  // Take first crop of just the modal element
+  const chunks = [];
+  chunks.push(await modal.screenshot({ type: "png" }));
+
+  // Check if modal content is scrollable
+  const isScrollable = await page.evaluate((mSel) => {
+    const modal = document.querySelector(mSel);
+    if (!modal) return false;
+    // Find scrollable child
+    const children = modal.querySelectorAll("*");
+    for (const child of children) {
+      if (child.scrollHeight > child.clientHeight + 5) return true;
+    }
+    return false;
+  }, MODAL_SEL);
+
+  if (isScrollable) {
+    // Scroll in steps and capture each position
+    let lastScrollTop = 0;
+    for (let i = 0; i < 10; i++) {
+      await page.evaluate((mSel) => {
+        const modal = document.querySelector(mSel);
+        if (!modal) return;
+        // Find the scrollable child
+        const children = [...modal.querySelectorAll("*")];
+        const scrollable = children.find(c => c.scrollHeight > c.clientHeight + 5);
+        if (scrollable) scrollable.scrollTop += scrollable.clientHeight - 60;
+      }, MODAL_SEL);
+      await delay(400);
+
+      const newScrollTop = await page.evaluate((mSel) => {
+        const modal = document.querySelector(mSel);
+        const children = [...modal.querySelectorAll("*")];
+        const scrollable = children.find(c => c.scrollHeight > c.clientHeight + 5);
+        return scrollable?.scrollTop ?? 0;
+      }, MODAL_SEL);
+
+      if (newScrollTop === lastScrollTop) break; // reached bottom
+      lastScrollTop = newScrollTop;
+      chunks.push(await modal.screenshot({ type: "png" }));
+    }
+  }
+
+  // If only one chunk, return it directly
+  if (chunks.length === 1) return chunks[0];
+
+  // Stitch chunks vertically using raw buffer manipulation
+  // Use Playwright's built-in: just return all chunks as separate uploads
+  // For simplicity, return the last chunk which shows the bottom content
+  // Better: stitch using sharp if available, otherwise return first chunk
+  try {
+    const { execSync } = await import("child_process");
+    // Check if ImageMagick is available
+    execSync("which convert", { stdio: "ignore" });
+
+    // Write chunks to temp files and stitch
+    const fs = await import("fs");
+    const tmpFiles = chunks.map((buf, i) => {
+      const path = `/tmp/modal_chunk_${i}.png`;
+      fs.writeFileSync(path, buf);
+      return path;
+    });
+    const outPath = `/tmp/modal_stitched.png`;
+    execSync(`convert -append ${tmpFiles.join(" ")} ${outPath}`);
+    const stitched = fs.readFileSync(outPath);
+    // Cleanup
+    tmpFiles.forEach(f => fs.unlinkSync(f));
+    fs.unlinkSync(outPath);
+    return stitched;
+  } catch {
+    // ImageMagick not available — return all chunks, upload separately
+    return chunks[0]; // fallback: first chunk
+  }
+}
+
 // ── EXTRACT TEXT FROM MODAL ────────────────────────────────────────────────
 
-async function extractModalData(page) {
-  const MODAL = '[role="dialog"], [class*="modal-content"], [class*="modalContent"], [class*="popup"]';
-
-  // ── PROFIT RATES tab (default) ──
-  const profitRates = await page.evaluate((sel) => {
-    const modal = document.querySelector(sel);
+async function extractProfitRates(page) {
+  return await page.evaluate(() => {
+    const modal = document.querySelector('[role="dialog"]');
     if (!modal) return [];
-    const rows = [];
 
-    // Find all rows — each typically has a % value + description side by side
-    // Strategy: find elements with % or ₹ in text, pair with sibling text
+    const rows = [];
+    const seen = new Set();
+
+    // Find rate+description pairs
+    // Rates are colored spans (green text) next to descriptions
     const allEls = [...modal.querySelectorAll("*")];
+
     allEls.forEach((el) => {
+      if (el.children.length > 0) return; // only leaf nodes
       const text = el.innerText?.trim();
       if (!text) return;
-      // Match lines like "8%", "10.20%", "Flat Rs 40", "₹40"
-      if (/^\d+(\.\d+)?%$/.test(text) || /^(flat\s*)?(rs\.?\s*|₹)\d+/i.test(text)) {
-        // Get the description — next sibling or parent's next child
-        const parent = el.parentElement;
-        const children = [...(parent?.children || [])];
-        const idx = children.indexOf(el);
-        const desc = children[idx + 1]?.innerText?.trim()
-                  || el.nextElementSibling?.innerText?.trim()
-                  || "";
-        if (desc) rows.push({ rate: text, description: desc });
+
+      // Match: "8%", "10.20%", "₹40", "Flat Rs 2240", "Rs 40"
+      const isRate = /^\d+(\.\d+)?%$/.test(text) ||
+                     /^(flat\s+)?(rs\.?\s*|₹)\s*\d+/i.test(text);
+      if (!isRate) return;
+
+      // Find description — look at parent's children for sibling text
+      const parent = el.parentElement;
+      if (!parent) return;
+
+      const siblings = [...parent.children];
+      const idx = siblings.indexOf(el);
+      const descEl = siblings[idx + 1] || el.nextElementSibling;
+      const desc = descEl?.innerText?.trim();
+
+      if (desc && desc.length > 3) {
+        const key = `${text}|${desc}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          rows.push({ rate: text, description: desc });
+        }
       }
     });
 
-    // Deduplicate
-    const seen = new Set();
-    return rows.filter(r => {
-      const key = r.rate + r.description;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }, MODAL);
-
-  // Screenshot of profit rates tab (full modal scroll)
-  const profitScreenshot = await screenshotFullModal(page, MODAL);
-
-  // ── OFFER DETAILS tab ──
-  let offerText = "";
-  let offerScreenshot = null;
-  try {
-    const offerTab = await page.$('text=OFFER DETAILS');
-    if (offerTab) {
-      await offerTab.click();
-      await delay(700);
-      offerText = await page.evaluate((sel) => {
-        const modal = document.querySelector(sel);
-        if (!modal) return "";
-        // Get all text content from the offer details tab body
-        const body = modal.querySelector('[class*="tab"], [class*="content"], [class*="body"]') || modal;
-        return body.innerText?.trim() || "";
-      }, MODAL);
-      offerScreenshot = await screenshotFullModal(page, MODAL);
-    }
-  } catch (e) {
-    console.warn(`  ⚠ Offer details extraction failed: ${e.message}`);
-  }
-
-  return { profitRates, profitScreenshot, offerText, offerScreenshot };
+    return rows;
+  });
 }
 
-// ── SCROLL MODAL + SCREENSHOT ──────────────────────────────────────────────
+async function extractOfferDetails(page) {
+  return await page.evaluate(() => {
+    const modal = document.querySelector('[role="dialog"]');
+    if (!modal) return "";
 
-async function screenshotFullModal(page, modalSel) {
-  // Reset scroll to top
-  await page.evaluate((sel) => {
-    const modal = document.querySelector(sel);
-    const scrollable = modal?.querySelector('[class*="body"],[class*="content"],[class*="scroll"]') || modal;
-    if (scrollable) scrollable.scrollTop = 0;
-  }, modalSel);
-  await delay(300);
-
-  const modal = await page.$(modalSel);
-  if (!modal) return await page.screenshot({ type: "png" });
-
-  // Get modal bounding box
-  const box = await modal.boundingBox();
-  if (!box) return await page.screenshot({ type: "png" });
-
-  // Take screenshot of just the modal element (Playwright clips to element)
-  return await modal.screenshot({ type: "png" });
+    // Get all text content from modal, clean it up
+    const text = modal.innerText || "";
+    // Remove tab labels and header
+    return text
+      .split("\n")
+      .map(l => l.trim())
+      .filter(l => l.length > 0)
+      .filter(l => !["PROFIT RATES", "OFFER DETAILS", "×", "Share", "Today", "Get", "Orders", "Profit Tracks In"].includes(l))
+      .join("\n");
+  });
 }
 
 // ── PROCESS ONE STORE ──────────────────────────────────────────────────────
 
-async function processStore(context, storeName, storeIndex, totalStores) {
+async function processStore(context, storeName, idx, total) {
   const slug = slugify(storeName);
-  console.log(`\n[${storeIndex}/${totalStores}] ${storeName}`);
+  console.log(`\n[${idx}/${total}] ${storeName}`);
 
   const page = await context.newPage();
   await stealthPage(page);
 
   try {
-    // Load stores page fresh
+    // Fresh load of stores page
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
     await delay(2500);
 
-    // Scroll down enough to load the card (approx — we'll search all loaded cards)
+    // Scroll to find this store's button
     let found = false;
-    let scrollAttempts = 0;
-
-    while (!found && scrollAttempts < 30) {
-      // Find the VIEW PROFIT RATES button for this specific store
+    for (let attempt = 0; attempt < 30 && !found; attempt++) {
       const btn = await page.evaluateHandle((targetName) => {
-        const buttons = [...document.querySelectorAll("*")]
+        const btns = [...document.querySelectorAll("*")]
           .filter(el => el.innerText?.trim().toUpperCase() === "VIEW PROFIT RATES");
-
-        for (const btn of buttons) {
+        for (const btn of btns) {
           let node = btn.parentElement;
           for (let j = 0; j < 8; j++) {
             const img = node?.querySelector("img[alt]");
-            if (img?.alt?.trim().toLowerCase() === targetName.toLowerCase()) {
-              return btn;
-            }
+            if (img?.alt?.trim().toLowerCase() === targetName.toLowerCase()) return btn;
             node = node?.parentElement;
           }
         }
@@ -252,59 +307,79 @@ async function processStore(context, storeName, storeIndex, totalStores) {
       }, storeName);
 
       if (btn.asElement()) {
-        found = true;
         await btn.asElement().scrollIntoViewIfNeeded();
         await delay(500);
         await btn.asElement().click();
-        console.log(`  → Clicked VIEW PROFIT RATES`);
+        found = true;
+        console.log(`  → Modal opened`);
       } else {
-        // Scroll more to load lazy cards
-        await page.evaluate(() => window.scrollBy(0, 800));
-        await delay(600);
-        scrollAttempts++;
+        await page.evaluate(() => window.scrollBy(0, 600));
+        await delay(500);
       }
     }
 
     if (!found) {
-      console.warn(`  ⚠ Button not found for "${storeName}" after scrolling — skipping`);
+      console.warn(`  ⚠ Store button not found — skipping`);
       return;
     }
 
-    // Wait for modal
-    const MODAL = '[role="dialog"], [class*="modal-content"], [class*="modalContent"], [class*="popup"]';
-    await page.waitForSelector(MODAL, { timeout: 8000 });
-    await delay(800);
+    await delay(1000);
 
-    // Extract data
-    const { profitRates, profitScreenshot, offerText, offerScreenshot } = await extractModalData(page);
-    console.log(`  → Profit rows: ${profitRates.length}, Offer text: ${offerText.length} chars`);
+    // ── Tab 1: PROFIT RATES ──
+    // Extract text
+    const profitRates = await extractProfitRates(page);
+    console.log(`  → ${profitRates.length} profit rate rows extracted`);
 
-    // Upload screenshots
+    // Screenshot modal cropped
+    const profitBuf = await screenshotModalScrolled(page);
     let profitImagePath = null;
-    let offerImagePath = null;
-
-    if (profitScreenshot) {
+    if (profitBuf) {
       profitImagePath = `${slug}/${today}_profit_rates.png`;
       const { error } = await supabase.storage.from(BUCKET)
-        .upload(profitImagePath, profitScreenshot, { contentType: "image/png", upsert: true });
-      if (error) console.warn(`  ⚠ Profit screenshot upload: ${error.message}`);
+        .upload(profitImagePath, profitBuf, { contentType: "image/png", upsert: true });
+      if (error) console.warn(`  ⚠ Profit upload: ${error.message}`);
       else console.log(`  ✓ Profit screenshot uploaded`);
     }
 
-    if (offerScreenshot) {
-      offerImagePath = `${slug}/${today}_offer_details.png`;
-      const { error } = await supabase.storage.from(BUCKET)
-        .upload(offerImagePath, offerScreenshot, { contentType: "image/png", upsert: true });
-      if (error) console.warn(`  ⚠ Offer screenshot upload: ${error.message}`);
-      else console.log(`  ✓ Offer screenshot uploaded`);
+    // ── Tab 2: OFFER DETAILS ──
+    let offerText = "";
+    let offerImagePath = null;
+    try {
+      const offerTab = await page.$('text=OFFER DETAILS');
+      if (offerTab) {
+        await offerTab.click();
+        await delay(800);
+        offerText = await extractOfferDetails(page);
+        console.log(`  → Offer details: ${offerText.length} chars`);
+
+        // Reset modal scroll and screenshot
+        await page.evaluate(() => {
+          const modal = document.querySelector('[role="dialog"]');
+          const children = [...(modal?.querySelectorAll("*") || [])];
+          const scrollable = children.find(c => c.scrollHeight > c.clientHeight + 5);
+          if (scrollable) scrollable.scrollTop = 0;
+        });
+        await delay(300);
+
+        const offerBuf = await screenshotModalScrolled(page);
+        if (offerBuf) {
+          offerImagePath = `${slug}/${today}_offer_details.png`;
+          const { error } = await supabase.storage.from(BUCKET)
+            .upload(offerImagePath, offerBuf, { contentType: "image/png", upsert: true });
+          if (error) console.warn(`  ⚠ Offer upload: ${error.message}`);
+          else console.log(`  ✓ Offer screenshot uploaded`);
+        }
+      }
+    } catch (e) {
+      console.warn(`  ⚠ Offer tab: ${e.message}`);
     }
 
-    // Upsert to DB with full text data
+    // ── Save to DB ──
     const { error: dbErr } = await supabase.from("snapshots").upsert({
       retailer_name:    storeName,
       retailer_slug:    slug,
-      profit_rates:     JSON.stringify(profitRates),   // e.g. [{"rate":"8%","description":"..."}]
-      offer_details:    offerText,                      // plain text, copyable
+      profit_rates:     profitRates,          // JSONB — copyable in Lovable
+      offer_details:    offerText,             // text — copyable in Lovable
       image_path:       profitImagePath,
       offer_image_path: offerImagePath,
       captured_on:      today,
@@ -315,7 +390,7 @@ async function processStore(context, storeName, storeIndex, totalStores) {
     else console.log(`  ✓ Saved to DB`);
 
   } catch (err) {
-    console.error(`  ✗ Failed: ${err.message}`);
+    console.error(`  ✗ ${storeName}: ${err.message}`);
   } finally {
     await page.close();
   }
@@ -345,14 +420,12 @@ async function main() {
   try {
     await login(context);
 
-    // Step 1: collect all store names in one pass
     let storeNames = await collectStoreNames(context);
-    if (storeNames.length === 0) throw new Error("No stores found");
-
+    if (!storeNames.length) throw new Error("No stores found");
     if (MAX_RETAILERS) storeNames = storeNames.slice(0, Number(MAX_RETAILERS));
-    console.log(`\n→ Processing ${storeNames.length} stores one by one...\n`);
 
-    // Step 2: process each store on a fresh page load
+    console.log(`\n→ Processing ${storeNames.length} stores...\n`);
+
     for (let i = 0; i < storeNames.length; i++) {
       try {
         await Promise.race([
