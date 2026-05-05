@@ -1,15 +1,13 @@
 /**
  * EarnKaro scraper - Daily Edition
- * - Scrolls inside modal to capture full content
- * - Stitches all scroll positions into one tall image
- * - Captures both PROFIT RATES + OFFER DETAILS tabs
- * - Robust timeout handling so one stuck store doesn't block all
+ * - Extracts profit rates + offer details as TEXT (copyable)
+ * - Also saves screenshot of modal
+ * - Reloads stores page for each store to avoid DOM shift issues
  */
 
 import { chromium } from "playwright";
 import { createClient } from "@supabase/supabase-js";
 import ws from "ws";
-import { createCanvas, loadImage } from "canvas";
 
 const {
   SUPABASE_URL,
@@ -33,7 +31,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 const BUCKET      = "earnkaro";
 const today       = new Date().toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
-const STORE_TIMEOUT_MS = 45000; // max 45s per store before skipping
 
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -51,77 +48,6 @@ async function stealthPage(page) {
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
     window.chrome = { runtime: {} };
   });
-}
-
-// Scroll inside modal and stitch screenshots into one tall image
-async function screenshotModalFull(page, modalSel) {
-  const modal = await page.$(modalSel);
-  if (!modal) {
-    // Fallback: just screenshot viewport
-    return await page.screenshot({ type: "png" });
-  }
-
-  const box = await modal.boundingBox();
-  if (!box) return await page.screenshot({ type: "png" });
-
-  // Scroll modal content to top
-  await page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    const scrollable = el?.querySelector('[class*="body"], [class*="content"], [class*="scroll"]') || el;
-    if (scrollable) scrollable.scrollTop = 0;
-  }, modalSel);
-  await delay(400);
-
-  const screenshots = [];
-  let lastScrollTop = -1;
-
-  // Scroll and capture in chunks
-  while (true) {
-    const buf = await page.screenshot({ type: "png", clip: box });
-    screenshots.push(buf);
-
-    const { scrollTop, scrollHeight, clientHeight } = await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      const scrollable = el?.querySelector('[class*="body"], [class*="content"], [class*="scroll"]') || el;
-      return {
-        scrollTop:    scrollable?.scrollTop ?? 0,
-        scrollHeight: scrollable?.scrollHeight ?? 0,
-        clientHeight: scrollable?.clientHeight ?? 0,
-      };
-    }, modalSel);
-
-    if (scrollTop === lastScrollTop || scrollTop + clientHeight >= scrollHeight) break;
-    lastScrollTop = scrollTop;
-
-    // Scroll down by modal height
-    await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      const scrollable = el?.querySelector('[class*="body"], [class*="content"], [class*="scroll"]') || el;
-      if (scrollable) scrollable.scrollTop += scrollable.clientHeight - 40;
-    }, modalSel);
-    await delay(400);
-  }
-
-  if (screenshots.length === 1) return screenshots[0];
-
-  // Stitch screenshots vertically using canvas
-  const images = await Promise.all(screenshots.map(b => loadImage(b)));
-  const totalHeight = images.reduce((sum, img) => sum + img.height, 0);
-  const canvas = createCanvas(images[0].width, totalHeight);
-  const ctx = canvas.getContext("2d");
-  let y = 0;
-  for (const img of images) {
-    ctx.drawImage(img, 0, y);
-    y += img.height;
-  }
-  return canvas.toBuffer("image/png");
-}
-
-async function uploadBuffer(buffer, path) {
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .upload(path, buffer, { contentType: "image/png", upsert: true });
-  if (error) throw new Error(`Upload: ${error.message}`);
 }
 
 // ── LOGIN ──────────────────────────────────────────────────────────────────
@@ -143,153 +69,256 @@ async function login(context) {
     await delay(400);
     await page.click('button:has-text("Continue")');
     await page.waitForFunction(() => !window.location.href.includes("/login"), { timeout: 20000 });
-    console.log(`✓ Logged in`);
+    console.log("✓ Logged in");
   } finally {
     await page.close();
   }
 }
 
-// ── SCRAPE ALL STORES ─────────────────────────────────────────────────────
+// ── LOAD STORES PAGE + COLLECT ALL STORE NAMES ────────────────────────────
+// Returns array of store names in order from the page
 
-async function scrapeAllStores(context) {
+async function collectStoreNames(context) {
+  const page = await context.newPage();
+  await stealthPage(page);
+  try {
+    console.log("→ Loading stores page to collect names...");
+    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
+    await delay(3000);
+
+    // Scroll all the way down to load lazy cards
+    let prevHeight = 0;
+    for (let i = 0; i < 40; i++) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await delay(700);
+      const h = await page.evaluate(() => document.body.scrollHeight);
+      if (h === prevHeight) break;
+      prevHeight = h;
+    }
+    await delay(500);
+
+    // Collect store names from img[alt] inside each card that has VIEW PROFIT RATES
+    const names = await page.evaluate(() => {
+      const results = [];
+      document.querySelectorAll("*").forEach((el) => {
+        if (el.innerText?.trim().toUpperCase() !== "VIEW PROFIT RATES") return;
+        // Walk up to find img[alt] in the card
+        let node = el.parentElement;
+        for (let j = 0; j < 8; j++) {
+          const img = node?.querySelector("img[alt]");
+          if (img?.alt?.trim()) {
+            results.push(img.alt.trim());
+            return;
+          }
+          node = node?.parentElement;
+        }
+        results.push(null); // placeholder if name not found
+      });
+      return results;
+    });
+
+    const valid = names.filter(Boolean);
+    console.log(`→ Found ${valid.length} stores`);
+    return valid;
+  } finally {
+    await page.close();
+  }
+}
+
+// ── EXTRACT TEXT FROM MODAL ────────────────────────────────────────────────
+
+async function extractModalData(page) {
+  const MODAL = '[role="dialog"], [class*="modal-content"], [class*="modalContent"], [class*="popup"]';
+
+  // ── PROFIT RATES tab (default) ──
+  const profitRates = await page.evaluate((sel) => {
+    const modal = document.querySelector(sel);
+    if (!modal) return [];
+    const rows = [];
+
+    // Find all rows — each typically has a % value + description side by side
+    // Strategy: find elements with % or ₹ in text, pair with sibling text
+    const allEls = [...modal.querySelectorAll("*")];
+    allEls.forEach((el) => {
+      const text = el.innerText?.trim();
+      if (!text) return;
+      // Match lines like "8%", "10.20%", "Flat Rs 40", "₹40"
+      if (/^\d+(\.\d+)?%$/.test(text) || /^(flat\s*)?(rs\.?\s*|₹)\d+/i.test(text)) {
+        // Get the description — next sibling or parent's next child
+        const parent = el.parentElement;
+        const children = [...(parent?.children || [])];
+        const idx = children.indexOf(el);
+        const desc = children[idx + 1]?.innerText?.trim()
+                  || el.nextElementSibling?.innerText?.trim()
+                  || "";
+        if (desc) rows.push({ rate: text, description: desc });
+      }
+    });
+
+    // Deduplicate
+    const seen = new Set();
+    return rows.filter(r => {
+      const key = r.rate + r.description;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, MODAL);
+
+  // Screenshot of profit rates tab (full modal scroll)
+  const profitScreenshot = await screenshotFullModal(page, MODAL);
+
+  // ── OFFER DETAILS tab ──
+  let offerText = "";
+  let offerScreenshot = null;
+  try {
+    const offerTab = await page.$('text=OFFER DETAILS');
+    if (offerTab) {
+      await offerTab.click();
+      await delay(700);
+      offerText = await page.evaluate((sel) => {
+        const modal = document.querySelector(sel);
+        if (!modal) return "";
+        // Get all text content from the offer details tab body
+        const body = modal.querySelector('[class*="tab"], [class*="content"], [class*="body"]') || modal;
+        return body.innerText?.trim() || "";
+      }, MODAL);
+      offerScreenshot = await screenshotFullModal(page, MODAL);
+    }
+  } catch (e) {
+    console.warn(`  ⚠ Offer details extraction failed: ${e.message}`);
+  }
+
+  return { profitRates, profitScreenshot, offerText, offerScreenshot };
+}
+
+// ── SCROLL MODAL + SCREENSHOT ──────────────────────────────────────────────
+
+async function screenshotFullModal(page, modalSel) {
+  // Reset scroll to top
+  await page.evaluate((sel) => {
+    const modal = document.querySelector(sel);
+    const scrollable = modal?.querySelector('[class*="body"],[class*="content"],[class*="scroll"]') || modal;
+    if (scrollable) scrollable.scrollTop = 0;
+  }, modalSel);
+  await delay(300);
+
+  const modal = await page.$(modalSel);
+  if (!modal) return await page.screenshot({ type: "png" });
+
+  // Get modal bounding box
+  const box = await modal.boundingBox();
+  if (!box) return await page.screenshot({ type: "png" });
+
+  // Take screenshot of just the modal element (Playwright clips to element)
+  return await modal.screenshot({ type: "png" });
+}
+
+// ── PROCESS ONE STORE ──────────────────────────────────────────────────────
+
+async function processStore(context, storeName, storeIndex, totalStores) {
+  const slug = slugify(storeName);
+  console.log(`\n[${storeIndex}/${totalStores}] ${storeName}`);
+
   const page = await context.newPage();
   await stealthPage(page);
 
-  console.log("→ Loading partners page...");
-  await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
-  await delay(3000);
+  try {
+    // Load stores page fresh
+    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
+    await delay(2500);
 
-  // Scroll to bottom to load all lazy cards
-  console.log("→ Scrolling to load all cards...");
-  let prevHeight = 0;
-  for (let i = 0; i < 40; i++) {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await delay(800);
-    const h = await page.evaluate(() => document.body.scrollHeight);
-    if (h === prevHeight) break;
-    prevHeight = h;
-  }
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await delay(800);
+    // Scroll down enough to load the card (approx — we'll search all loaded cards)
+    let found = false;
+    let scrollAttempts = 0;
 
-  // Count VIEW PROFIT RATES buttons
-  const totalStores = await page.evaluate(() =>
-    [...document.querySelectorAll("*")]
-      .filter(el => el.innerText?.trim().toUpperCase() === "VIEW PROFIT RATES")
-      .length
-  );
-  console.log(`→ Found ${totalStores} stores`);
+    while (!found && scrollAttempts < 30) {
+      // Find the VIEW PROFIT RATES button for this specific store
+      const btn = await page.evaluateHandle((targetName) => {
+        const buttons = [...document.querySelectorAll("*")]
+          .filter(el => el.innerText?.trim().toUpperCase() === "VIEW PROFIT RATES");
 
-  if (totalStores === 0) {
-    await page.screenshot({ path: "debug_no_stores.png", fullPage: true });
-    throw new Error("No stores found");
-  }
-
-  const limit = MAX_RETAILERS ? Number(MAX_RETAILERS) : totalStores;
-  const MODAL_SEL = '[role="dialog"], .modal-content, [class*="modal"][class*="content"], [class*="popup"]';
-
-  for (let i = 0; i < Math.min(limit, totalStores); i++) {
-    // Re-fetch buttons fresh each iteration (DOM can shift)
-    const allBtns = await page.$$("text=VIEW PROFIT RATES");
-    if (i >= allBtns.length) { console.log("→ No more buttons found, stopping"); break; }
-
-    const btn = allBtns[i];
-
-    // Get store name from img[alt] inside the same card
-    const storeName = await btn.evaluate((el) => {
-      let node = el.parentElement;
-      for (let j = 0; j < 6; j++) {
-        const img = node?.querySelector("img[alt]");
-        if (img?.alt?.trim()) return img.alt.trim();
-        node = node?.parentElement;
-      }
-      return null;
-    });
-
-    if (!storeName) { console.log(`[${i+1}] Skipping — no store name found`); continue; }
-
-    const slug = slugify(storeName);
-    console.log(`\n[${i+1}/${Math.min(limit, totalStores)}] ${storeName}`);
-
-    // Per-store timeout — skip if hangs
-    const storeTimeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Store timeout after 45s")), STORE_TIMEOUT_MS)
-    );
-
-    try {
-      await Promise.race([
-        (async () => {
-          await btn.scrollIntoViewIfNeeded();
-          await delay(400);
-          await btn.click();
-          await delay(1500);
-
-          // Wait for modal
-          await page.waitForSelector(MODAL_SEL, { timeout: 8000 });
-          await delay(600);
-
-          // ── Tab 1: PROFIT RATES (default) — scroll & stitch ──
-          const profitBuf = await screenshotModalFull(page, MODAL_SEL);
-          await uploadBuffer(profitBuf, `${slug}/${today}_profit_rates.png`);
-          console.log(`  ✓ Profit rates`);
-
-          // ── Tab 2: OFFER DETAILS ──
-          try {
-            // Click the tab
-            const offerTab = await page.$('text=OFFER DETAILS');
-            if (offerTab) {
-              await offerTab.click();
-              await delay(800);
-              // Scroll modal back to top for offer details
-              await page.evaluate((sel) => {
-                const el = document.querySelector(sel);
-                const scrollable = el?.querySelector('[class*="body"],[class*="content"],[class*="scroll"]') || el;
-                if (scrollable) scrollable.scrollTop = 0;
-              }, MODAL_SEL);
-              await delay(400);
-              const offerBuf = await screenshotModalFull(page, MODAL_SEL);
-              await uploadBuffer(offerBuf, `${slug}/${today}_offer_details.png`);
-              console.log(`  ✓ Offer details`);
-            } else {
-              console.warn(`  ⚠ OFFER DETAILS tab not found for ${storeName}`);
+        for (const btn of buttons) {
+          let node = btn.parentElement;
+          for (let j = 0; j < 8; j++) {
+            const img = node?.querySelector("img[alt]");
+            if (img?.alt?.trim().toLowerCase() === targetName.toLowerCase()) {
+              return btn;
             }
-          } catch (e) {
-            console.warn(`  ⚠ Offer details failed: ${e.message}`);
+            node = node?.parentElement;
           }
+        }
+        return null;
+      }, storeName);
 
-          // ── DB upsert ──
-          const { error } = await supabase.from("snapshots").upsert({
-            retailer_name:    storeName,
-            retailer_slug:    slug,
-            image_path:       `${slug}/${today}_profit_rates.png`,
-            offer_image_path: `${slug}/${today}_offer_details.png`,
-            captured_on:      today,
-            updated_at:       new Date().toISOString(),
-          }, { onConflict: "retailer_slug,captured_on" });
-          if (error) console.warn(`  ⚠ DB: ${error.message}`);
-
-          // ── Close modal ──
-          try {
-            const closeBtn = await page.$('[aria-label="Close"], button:has-text("×"), [class*="close-btn"], [class*="closeBtn"]');
-            if (closeBtn) await closeBtn.click();
-            else await page.keyboard.press("Escape");
-          } catch { await page.keyboard.press("Escape"); }
-          await delay(600);
-
-          console.log(`  ✓ Done`);
-        })(),
-        storeTimeout,
-      ]);
-    } catch (err) {
-      console.error(`  ✗ ${storeName}: ${err.message}`);
-      // Force close modal and continue
-      try { await page.keyboard.press("Escape"); } catch {}
-      await delay(800);
+      if (btn.asElement()) {
+        found = true;
+        await btn.asElement().scrollIntoViewIfNeeded();
+        await delay(500);
+        await btn.asElement().click();
+        console.log(`  → Clicked VIEW PROFIT RATES`);
+      } else {
+        // Scroll more to load lazy cards
+        await page.evaluate(() => window.scrollBy(0, 800));
+        await delay(600);
+        scrollAttempts++;
+      }
     }
-  }
 
-  await page.screenshot({ path: "debug_final.png" });
-  await page.close();
+    if (!found) {
+      console.warn(`  ⚠ Button not found for "${storeName}" after scrolling — skipping`);
+      return;
+    }
+
+    // Wait for modal
+    const MODAL = '[role="dialog"], [class*="modal-content"], [class*="modalContent"], [class*="popup"]';
+    await page.waitForSelector(MODAL, { timeout: 8000 });
+    await delay(800);
+
+    // Extract data
+    const { profitRates, profitScreenshot, offerText, offerScreenshot } = await extractModalData(page);
+    console.log(`  → Profit rows: ${profitRates.length}, Offer text: ${offerText.length} chars`);
+
+    // Upload screenshots
+    let profitImagePath = null;
+    let offerImagePath = null;
+
+    if (profitScreenshot) {
+      profitImagePath = `${slug}/${today}_profit_rates.png`;
+      const { error } = await supabase.storage.from(BUCKET)
+        .upload(profitImagePath, profitScreenshot, { contentType: "image/png", upsert: true });
+      if (error) console.warn(`  ⚠ Profit screenshot upload: ${error.message}`);
+      else console.log(`  ✓ Profit screenshot uploaded`);
+    }
+
+    if (offerScreenshot) {
+      offerImagePath = `${slug}/${today}_offer_details.png`;
+      const { error } = await supabase.storage.from(BUCKET)
+        .upload(offerImagePath, offerScreenshot, { contentType: "image/png", upsert: true });
+      if (error) console.warn(`  ⚠ Offer screenshot upload: ${error.message}`);
+      else console.log(`  ✓ Offer screenshot uploaded`);
+    }
+
+    // Upsert to DB with full text data
+    const { error: dbErr } = await supabase.from("snapshots").upsert({
+      retailer_name:    storeName,
+      retailer_slug:    slug,
+      profit_rates:     JSON.stringify(profitRates),   // e.g. [{"rate":"8%","description":"..."}]
+      offer_details:    offerText,                      // plain text, copyable
+      image_path:       profitImagePath,
+      offer_image_path: offerImagePath,
+      captured_on:      today,
+      updated_at:       new Date().toISOString(),
+    }, { onConflict: "retailer_slug,captured_on" });
+
+    if (dbErr) console.warn(`  ⚠ DB: ${dbErr.message}`);
+    else console.log(`  ✓ Saved to DB`);
+
+  } catch (err) {
+    console.error(`  ✗ Failed: ${err.message}`);
+  } finally {
+    await page.close();
+  }
 }
 
 // ── MAIN ───────────────────────────────────────────────────────────────────
@@ -298,9 +327,14 @@ async function main() {
   console.log("→ Launching browser...");
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-           "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    args: [
+      "--no-sandbox", "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+      "--window-size=1920,1080",
+    ],
   });
+
   const context = await browser.newContext({
     viewport:   { width: 1920, height: 1080 },
     userAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -310,7 +344,26 @@ async function main() {
 
   try {
     await login(context);
-    await scrapeAllStores(context);
+
+    // Step 1: collect all store names in one pass
+    let storeNames = await collectStoreNames(context);
+    if (storeNames.length === 0) throw new Error("No stores found");
+
+    if (MAX_RETAILERS) storeNames = storeNames.slice(0, Number(MAX_RETAILERS));
+    console.log(`\n→ Processing ${storeNames.length} stores one by one...\n`);
+
+    // Step 2: process each store on a fresh page load
+    for (let i = 0; i < storeNames.length; i++) {
+      try {
+        await Promise.race([
+          processStore(context, storeNames[i], i + 1, storeNames.length),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("45s timeout")), 45000)),
+        ]);
+      } catch (err) {
+        console.error(`  ✗ Skipped "${storeNames[i]}": ${err.message}`);
+      }
+    }
+
     console.log("\n✓ All done");
   } finally {
     await context.close();
