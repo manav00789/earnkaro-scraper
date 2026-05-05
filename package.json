@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@supabase/supabase-js": "^2.x.x",
-    "playwright": "^1.x.x",
-    "p-limit": "^5.x.x",
-    "ws": "^8.x.x"
+    "@supabase/supabase-js": "^2",
+    "canvas": "^2.11.2",
+    "p-limit": "^6",
+    "playwright": "^1.44",
+    "ws": "^8"
   }
 }
