@@ -1,29 +1,42 @@
 name: Hourly Retailer Scrape
+
 on:
   schedule:
-    - cron: '0 * * * *' # This runs it every hour on the dot
-  workflow_dispatch: # This adds the "Run workflow" button so you can test it manually
+    - cron: '0 * * * *'   # every hour on the dot
+  workflow_dispatch:        # manual "Run workflow" button
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          
+
       - name: Install dependencies
-        run: npm install playwright @supabase/supabase-js p-limit
-        
-      - name: Install Playwright Browser
-        run: npx playwright install chromium
-        
+        run: npm install playwright @supabase/supabase-js p-limit ws
+        #                                                         ^^^ added ws for Node 20
+
+      - name: Install Playwright Browser + system deps
+        run: npx playwright install chromium --with-deps
+        #                                    ^^^^^^^^^^^ critical: installs OS libs needed in CI
+
       - name: Run Scraper
         run: node scraper.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EARNKARO_COOKIE_STRING: ${{ secrets.EARNKARO_COOKIE_STRING }}
+
+      # Saves screenshot on failure so you can download and debug
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug_discover.png
+          retention-days: 3
