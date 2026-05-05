@@ -12,7 +12,7 @@ const {
   EARNKARO_EMAIL    = "manav.sharma@acem.edu.in",
   EARNKARO_PASSWORD = "manav11",
   PAGE_TIMEOUT_MS   = "30000",
-  MAX_RETAILERS     = "3",
+  MAX_RETAILERS,
   START_URL         = "https://earnkaro.com/stores",
 } = process.env;
 
@@ -185,15 +185,11 @@ async function processStore(context, storeName, idx, total) {
 
     // Try many possible modal selectors
     const MODAL_SELECTORS = [
+      '#streInforpp > div',              // earnkaro specific — white popup inside overlay
+      '[class*="popupOverlay"] > div',   // earnkaro fallback
       '[role="dialog"]',
       '[class*="modal"]:not([class*="backdrop"])',
-      '[class*="Modal"]:not([class*="Backdrop"])',
-      '[class*="popup"]',
-      '[class*="Popup"]',
-      '[class*="overlay"]:not([class*="dark"]):not([class*="back"])',
-      '[class*="drawer"]',
-      '[class*="sheet"]',
-      'div[style*="z-index: 1"][style*="position: fixed"]',
+      '[class*="popup"] > div',
     ];
 
     let modalEl = null;
