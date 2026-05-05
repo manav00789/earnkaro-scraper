@@ -4,8 +4,6 @@
   "type": "module",
   "dependencies": {
     "@supabase/supabase-js": "^2",
-    "canvas": "^2.11.2",
-    "p-limit": "^6",
     "playwright": "^1.44",
     "ws": "^8"
   }
