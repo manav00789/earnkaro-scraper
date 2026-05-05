@@ -1,8 +1,8 @@
 /**
  * EarnKaro scraper - GitHub Actions Edition
  * ---------------------------------------------------------------
+ * - Logs in with email + password (no OTP, no cookies needed)
  * - Headless Chromium via Playwright
- * - Cookie-string auth (no OTP/manual login needed in CI)
  * - Uploads screenshots to Supabase Storage
  * - Upserts metadata to `snapshots` table
  */
@@ -12,17 +12,18 @@ import { createClient } from "@supabase/supabase-js";
 import pLimit from "p-limit";
 import ws from "ws";
 
+// ---- env -----------------------------------------------------------------
+
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  EARNKARO_COOKIE_STRING = "",   // set in GitHub Secrets
-  CONCURRENCY = "3",
-  PAGE_TIMEOUT_MS = "60000",
+  EARNKARO_EMAIL    = "manav.sharma@acem.edu.in",
+  EARNKARO_PASSWORD = "manav11",
+  CONCURRENCY       = "3",
+  PAGE_TIMEOUT_MS   = "60000",
   MAX_RETAILERS,
-  START_URL = "https://earnkaro.com/stores",
+  START_URL         = "https://earnkaro.com/stores",
 } = process.env;
-
-// ---- guards --------------------------------------------------------------
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -32,15 +33,16 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
-  realtime: { transport: ws },   // required for Node 20
+  realtime: { transport: ws },
 });
 
 // ---- constants -----------------------------------------------------------
 
-const BUCKET        = "retailer-snapshots";
-const today         = new Date().toISOString().slice(0, 10);
-const pageTimeout   = Number(PAGE_TIMEOUT_MS);
-const concurrency   = Math.max(1, Number(CONCURRENCY));
+const BUCKET      = "retailer-snapshots";
+const today       = new Date().toISOString().slice(0, 10);
+const pageTimeout = Number(PAGE_TIMEOUT_MS);
+const concurrency = Math.max(1, Number(CONCURRENCY));
+const LOGIN_URL   = "https://earnkaro.com/login";
 
 // ---- helpers -------------------------------------------------------------
 
@@ -69,31 +71,135 @@ async function withRetry(label, fn, attempts = 3) {
   throw lastErr;
 }
 
-/**
- * Parse EARNKARO_COOKIE_STRING (copied from browser DevTools → Network tab)
- * Format expected:  name=value; name2=value2; ...
- * Returns a Playwright-compatible cookie array for earnkaro.com
- */
-function parseCookies(raw) {
-  if (!raw.trim()) return [];
-  return raw
-    .split(";")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const eqIdx = part.indexOf("=");
-      const name  = part.slice(0, eqIdx).trim();
-      const value = part.slice(eqIdx + 1).trim();
-      return {
-        name,
-        value,
-        domain: ".earnkaro.com",
-        path: "/",
-        httpOnly: false,
-        secure: true,
-        sameSite: "Lax",
-      };
-    });
+// ---- login ---------------------------------------------------------------
+
+async function login(context) {
+  console.log("→ Logging in...");
+  const page = await context.newPage();
+
+  try {
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
+    await delay(2000);
+    await page.screenshot({ path: "debug_login_start.png" });
+    console.log(`→ Login page: ${page.url()}`);
+
+    // Step 1: Enter email
+    const emailSelectors = [
+      'input[type="email"]',
+      'input[name="email"]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="mobile" i]',
+      'input[type="text"]',
+    ];
+
+    let emailField = null;
+    for (const sel of emailSelectors) {
+      emailField = await page.$(sel);
+      if (emailField) { console.log(`→ Email field: ${sel}`); break; }
+    }
+
+    if (!emailField) {
+      await page.screenshot({ path: "debug_login_no_email.png" });
+      throw new Error("Email input not found — see debug_login_no_email.png");
+    }
+
+    await emailField.click();
+    await emailField.fill("");
+    await emailField.type(EARNKARO_EMAIL, { delay: 60 });
+    await delay(500);
+
+    // Step 2: Click Continue / Next
+    const continueSelectors = [
+      'button:has-text("Continue")',
+      'button:has-text("Next")',
+      'button:has-text("Proceed")',
+      'button[type="submit"]',
+    ];
+
+    let clicked = false;
+    for (const sel of continueSelectors) {
+      try {
+        await page.click(sel, { timeout: 3000 });
+        clicked = true;
+        console.log(`→ Clicked: ${sel}`);
+        break;
+      } catch { /* try next */ }
+    }
+    if (!clicked) {
+      await emailField.press("Enter");
+      console.log("→ Pressed Enter on email field");
+    }
+
+    await delay(3000);
+    await page.screenshot({ path: "debug_login_after_email.png" });
+
+    // Step 3: Enter password
+    const passSelectors = [
+      'input[type="password"]',
+      'input[name="password"]',
+      'input[placeholder*="password" i]',
+    ];
+
+    let passField = null;
+    for (const sel of passSelectors) {
+      try {
+        await page.waitForSelector(sel, { timeout: 8000 });
+        passField = await page.$(sel);
+        if (passField) { console.log(`→ Password field: ${sel}`); break; }
+      } catch { /* try next */ }
+    }
+
+    if (!passField) {
+      await page.screenshot({ path: "debug_login_no_password.png" });
+      throw new Error("Password field not found — see debug_login_no_password.png");
+    }
+
+    await passField.click();
+    await passField.fill("");
+    await passField.type(EARNKARO_PASSWORD, { delay: 60 });
+    await delay(500);
+
+    // Step 4: Submit
+    const submitSelectors = [
+      'button:has-text("Login")',
+      'button:has-text("Sign in")',
+      'button:has-text("Continue")',
+      'button:has-text("Submit")',
+      'button[type="submit"]',
+    ];
+
+    let submitted = false;
+    for (const sel of submitSelectors) {
+      try {
+        await page.click(sel, { timeout: 3000 });
+        submitted = true;
+        console.log(`→ Submitted with: ${sel}`);
+        break;
+      } catch { /* try next */ }
+    }
+    if (!submitted) {
+      await passField.press("Enter");
+      console.log("→ Pressed Enter on password field");
+    }
+
+    // Step 5: Wait until off login page
+    try {
+      await page.waitForFunction(
+        () => !window.location.href.includes("/login"),
+        { timeout: 20000 }
+      );
+    } catch {
+      await page.screenshot({ path: "debug_login_failed.png" });
+      const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 300) ?? "");
+      throw new Error(`Login failed — still on ${page.url()}\n${bodyText}`);
+    }
+
+    console.log(`✓ Logged in! URL: ${page.url()}`);
+    await page.screenshot({ path: "debug_login_success.png" });
+
+  } finally {
+    await page.close();
+  }
 }
 
 // ---- discovery -----------------------------------------------------------
@@ -108,25 +214,42 @@ async function discoverRetailers(context) {
 
   console.log(`→ Navigating to: ${START_URL}`);
   await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
-  await delay(4000);
+  await delay(5000);
 
-  // Redirect to login = cookies are invalid / missing
-  if (page.url().includes("/login")) {
-    throw new Error(
-      "Redirected to login page — EARNKARO_COOKIE_STRING is missing or expired. " +
-      "Copy fresh cookies from your browser and update the GitHub secret."
-    );
+  await page.screenshot({ path: "debug_stores.png", fullPage: false });
+  console.log(`→ Stores URL: ${page.url()}`);
+
+  if (page.url().includes("/login") || page.url().includes("/signin")) {
+    throw new Error("Redirected to login after auth — session did not persist");
   }
 
-  // Wait for store grid
-  try {
-    await page.waitForSelector('a[href*="/stores/"]', { timeout: 30000 });
-  } catch {
-    await page.screenshot({ path: "debug_discover.png", fullPage: true });
-    throw new Error("Store grid not found — see debug_discover.png artifact");
+  const STORE_SELECTORS = [
+    'a[href*="/stores/"]',
+    '.store-card a',
+    '.retailer-card a',
+    '[class*="store"] a',
+    '[class*="retailer"] a',
+    'a[href*="/cashback/"]',
+  ];
+
+  let foundSelector = null;
+  for (const sel of STORE_SELECTORS) {
+    try {
+      await page.waitForSelector(sel, { timeout: 8000 });
+      foundSelector = sel;
+      console.log(`→ Store grid found: ${sel}`);
+      break;
+    } catch { /* try next */ }
   }
 
-  // Scroll to trigger lazy-load
+  if (!foundSelector) {
+    const title    = await page.title();
+    const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) ?? "");
+    console.error(`Title: "${title}"\nBody: ${bodyText}`);
+    throw new Error("Store grid not found — see debug_stores.png");
+  }
+
+  // Scroll to load all lazy-loaded stores
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let totalHeight = 0;
@@ -153,10 +276,7 @@ async function discoverRetailers(context) {
         .map((t) => t.trim())
         .find((t) => t.length > 0);
       if (name) {
-        out.set(href, {
-          name,
-          url: new URL(href, location.origin).toString(),
-        });
+        out.set(href, { name, url: new URL(href, location.origin).toString() });
       }
     });
     return Array.from(out.values());
@@ -175,23 +295,17 @@ async function captureRetailer(context, retailer) {
 
   try {
     await withRetry(`Capture: ${retailer.name}`, async () => {
-      await page.goto(retailer.url, {
-        waitUntil: "domcontentloaded",
-        timeout: pageTimeout,
-      });
+      await page.goto(retailer.url, { waitUntil: "domcontentloaded", timeout: pageTimeout });
       await delay(2500);
 
-      const buffer = await page.screenshot({ fullPage: true, type: "png" });
+      const buffer      = await page.screenshot({ fullPage: true, type: "png" });
       const storagePath = `${slug}/${today}.png`;
 
-      // Upload screenshot
       const { error: uploadErr } = await supabase.storage
         .from(BUCKET)
         .upload(storagePath, buffer, { contentType: "image/png", upsert: true });
+      if (uploadErr) throw new Error(`Upload: ${uploadErr.message}`);
 
-      if (uploadErr) throw new Error(`Storage upload: ${uploadErr.message}`);
-
-      // Upsert metadata row
       const { error: dbErr } = await supabase.from("snapshots").upsert(
         {
           retailer_name: retailer.name,
@@ -202,8 +316,7 @@ async function captureRetailer(context, retailer) {
         },
         { onConflict: "retailer_slug,captured_on" }
       );
-
-      if (dbErr) throw new Error(`DB upsert: ${dbErr.message}`);
+      if (dbErr) throw new Error(`DB: ${dbErr.message}`);
     });
 
     console.log(`✓ ${retailer.name}`);
@@ -217,15 +330,12 @@ async function captureRetailer(context, retailer) {
 // ---- main ----------------------------------------------------------------
 
 async function main() {
-  const cookies = parseCookies(EARNKARO_COOKIE_STRING);
-  console.log(`→ Loaded ${cookies.length} cookies from env`);
-
   const browser = await chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",         // critical for GitHub Actions
+      "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
     ],
   });
@@ -237,24 +347,16 @@ async function main() {
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   });
 
-  // Inject cookies so we're already logged in
-  if (cookies.length > 0) {
-    await context.addCookies(cookies);
-    console.log("→ Cookies injected");
-  } else {
-    console.warn("⚠ No cookies provided — scraper may hit login wall");
-  }
-
   try {
+    await login(context);
+
     let retailers = await discoverRetailers(context);
     if (MAX_RETAILERS) retailers = retailers.slice(0, Number(MAX_RETAILERS));
 
     const limit = pLimit(concurrency);
-    await Promise.all(
-      retailers.map((r) => limit(() => captureRetailer(context, r)))
-    );
+    await Promise.all(retailers.map((r) => limit(() => captureRetailer(context, r))));
 
-    console.log("✓ Done");
+    console.log("✓ All done");
   } finally {
     await context.close();
     await browser.close();
