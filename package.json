@@ -1,0 +1,11 @@
+{
+  "name": "earnkaro-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.x.x",
+    "playwright": "^1.x.x",
+    "p-limit": "^5.x.x",
+    "ws": "^8.x.x"
+  }
+}
