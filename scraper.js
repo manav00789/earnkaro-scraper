@@ -1,5 +1,9 @@
 /**
- * EarnKaro scraper - Modal Fix Edition
+ * EarnKaro scraper - Final Edition
+ * - Expands modal to full height before screenshot (no scroll/stitch needed)
+ * - Extracts profit rates + offer details as text (copyable)
+ * - Fresh page per store to avoid DOM drift
+ * - 45s timeout per store
  */
 
 import { chromium } from "playwright";
@@ -25,8 +29,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   realtime: { transport: ws },
 });
 
-const BUCKET    = "earnkaro";
-const today     = new Date().toISOString().slice(0, 10);
+const BUCKET      = "earnkaro";
+const today       = new Date().toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -46,36 +50,35 @@ async function stealthPage(page) {
   });
 }
 
-// Find the actual modal selector by inspecting DOM after click
-async function findModal(page) {
-  // Dump all high-z-index or fixed/absolute elements that appeared
-  const info = await page.evaluate(() => {
-    const candidates = [];
-    document.querySelectorAll("*").forEach((el) => {
-      const style = window.getComputedStyle(el);
-      const zIndex = parseInt(style.zIndex || "0");
-      const pos = style.position;
-      if ((pos === "fixed" || pos === "absolute") && zIndex > 10) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 200 && rect.height > 100) {
-          candidates.push({
-            tag: el.tagName,
-            id: el.id,
-            className: el.className?.toString().slice(0, 80),
-            role: el.getAttribute("role"),
-            zIndex,
-            w: Math.round(rect.width),
-            h: Math.round(rect.height),
-          });
-        }
+// ── Expand modal to full height then take one screenshot ──────────────────
+async function fullModalScreenshot(modalEl, page) {
+  // Force all clipped/scrollable children to expand
+  await page.evaluate(() => {
+    const overlay = document.querySelector('#streInforpp');
+    if (!overlay) return;
+    // Expand all scrollable children
+    [...overlay.querySelectorAll('*')].forEach(el => {
+      const s = window.getComputedStyle(el);
+      if ((s.overflowY === 'scroll' || s.overflowY === 'auto') &&
+          el.scrollHeight > el.clientHeight + 5) {
+        el.style.overflowY = 'visible';
+        el.style.height = el.scrollHeight + 'px';
+        el.style.maxHeight = 'none';
       }
     });
-    return candidates.slice(0, 10);
+    // Expand modal container
+    const modal = overlay.querySelector('div');
+    if (modal) {
+      modal.style.maxHeight = 'none';
+      modal.style.height = 'auto';
+      modal.style.overflowY = 'visible';
+    }
   });
-  console.log("  → Modal candidates:", JSON.stringify(info, null, 2));
-  return info;
+  await delay(400);
+  return await modalEl.screenshot({ type: 'png' });
 }
 
+// ── LOGIN ──────────────────────────────────────────────────────────────────
 async function login(context) {
   console.log("→ Logging in...");
   const page = await context.newPage();
@@ -99,6 +102,7 @@ async function login(context) {
   }
 }
 
+// ── COLLECT ALL STORE NAMES ────────────────────────────────────────────────
 async function collectStoreNames(context) {
   const page = await context.newPage();
   await stealthPage(page);
@@ -133,6 +137,48 @@ async function collectStoreNames(context) {
   }
 }
 
+// ── FIND MODAL ELEMENT ─────────────────────────────────────────────────────
+async function findModalEl(page) {
+  const MODAL_SELECTORS = [
+    '#streInforpp > div',
+    '[class*="popupOverlay"] > div',
+    '[role="dialog"]',
+    '[class*="modal"]:not([class*="backdrop"])',
+    '[class*="popup"] > div',
+  ];
+
+  for (const sel of MODAL_SELECTORS) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        const box = await el.boundingBox();
+        if (box && box.width > 200 && box.height > 100) {
+          console.log(`  ✓ Modal: ${sel} (${Math.round(box.width)}x${Math.round(box.height)})`);
+          return { el, sel };
+        }
+      }
+    } catch { /* try next */ }
+  }
+
+  // Text-based fallback
+  const handle = await page.evaluateHandle(() => {
+    return [...document.querySelectorAll("*")].find(el => {
+      const text = el.innerText?.trim();
+      const style = window.getComputedStyle(el);
+      return text?.includes("PROFIT RATES") && text?.includes("OFFER DETAILS") &&
+             (style.position === "fixed" || style.position === "absolute") &&
+             el.getBoundingClientRect().width > 200;
+    }) || null;
+  });
+
+  if (handle.asElement()) {
+    console.log("  ✓ Modal found via text fallback");
+    return { el: handle.asElement(), sel: "text-based" };
+  }
+  return null;
+}
+
+// ── PROCESS ONE STORE ──────────────────────────────────────────────────────
 async function processStore(context, storeName, idx, total) {
   const slug = slugify(storeName);
   console.log(`\n[${idx}/${total}] ${storeName}`);
@@ -143,7 +189,7 @@ async function processStore(context, storeName, idx, total) {
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
     await delay(2500);
 
-    // Find and click button
+    // Scroll to find and click the store button
     let found = false;
     for (let attempt = 0; attempt < 30 && !found; attempt++) {
       const btn = await page.evaluateHandle((targetName) => {
@@ -165,7 +211,7 @@ async function processStore(context, storeName, idx, total) {
         await delay(600);
         await btn.asElement().click();
         found = true;
-        console.log(`  ✓ Clicked button`);
+        console.log(`  ✓ Clicked VIEW PROFIT RATES`);
       } else {
         await page.evaluate(() => window.scrollBy(0, 600));
         await delay(500);
@@ -174,101 +220,34 @@ async function processStore(context, storeName, idx, total) {
 
     if (!found) { console.error("  ✗ Button not found"); return; }
 
-    // Wait longer for modal animation
-    await delay(2500);
+    await delay(2000);
 
-    // Take full page screenshot to see what happened
-    await page.screenshot({ path: `debug_after_click_${slug}.png`, fullPage: false });
+    // Find modal
+    const modal = await findModalEl(page);
+    if (!modal) { console.error("  ✗ Modal not found"); return; }
+    const { el: modalEl, sel: usedSel } = modal;
 
-    // Inspect DOM to find real modal selector
-    const modalCandidates = await findModal(page);
-
-    // Try many possible modal selectors
-    const MODAL_SELECTORS = [
-      '#streInforpp > div',              // earnkaro specific — white popup inside overlay
-      '[class*="popupOverlay"] > div',   // earnkaro fallback
-      '[role="dialog"]',
-      '[class*="modal"]:not([class*="backdrop"])',
-      '[class*="popup"] > div',
-    ];
-
-    let modalEl = null;
-    let usedSel = null;
-    for (const sel of MODAL_SELECTORS) {
-      try {
-        const el = await page.$(sel);
-        if (el) {
-          const box = await el.boundingBox();
-          if (box && box.width > 200 && box.height > 100) {
-            modalEl = el;
-            usedSel = sel;
-            console.log(`  ✓ Modal found with: ${sel} (${Math.round(box.width)}x${Math.round(box.height)})`);
-            break;
-          }
-        }
-      } catch { /* try next */ }
-    }
-
-    // If still not found, try finding element containing "PROFIT RATES" text
-    if (!modalEl) {
-      console.log("  → Trying text-based modal detection...");
-      modalEl = await page.evaluateHandle(() => {
-        const all = [...document.querySelectorAll("*")];
-        return all.find(el => {
-          const text = el.innerText?.trim();
-          const style = window.getComputedStyle(el);
-          return text?.includes("PROFIT RATES") &&
-                 text?.includes("OFFER DETAILS") &&
-                 (style.position === "fixed" || style.position === "absolute") &&
-                 el.getBoundingClientRect().width > 200;
-        }) || null;
-      });
-      if (modalEl.asElement()) {
-        console.log("  ✓ Modal found via text content");
-        modalEl = modalEl.asElement();
-        usedSel = "text-based";
-      } else {
-        modalEl = null;
-      }
-    }
-
-    if (!modalEl) {
-      console.error("  ✗ Modal not found with any selector");
-      console.log("  → Modal candidates found:", modalCandidates.length);
-      return;
-    }
-
-    // Screenshot just the modal element
-    const profitBuf = await modalEl.screenshot({ type: "png" });
-    console.log(`  ✓ Profit screenshot: ${profitBuf.length} bytes`);
-
-    // Extract profit rates text
+    // ── Tab 1: PROFIT RATES ──
+    // Extract text data
     const profitRates = await page.evaluate((sel) => {
-      let modal;
-      if (sel === "text-based") {
-        modal = [...document.querySelectorAll("*")].find(el =>
-          el.innerText?.includes("PROFIT RATES") && el.innerText?.includes("OFFER DETAILS") &&
-          window.getComputedStyle(el).position !== "static"
-        );
-      } else {
-        modal = document.querySelector(sel);
-      }
+      const modal = sel === "text-based"
+        ? [...document.querySelectorAll("*")].find(el =>
+            el.innerText?.includes("PROFIT RATES") &&
+            window.getComputedStyle(el).position !== "static")
+        : document.querySelector(sel);
       if (!modal) return [];
 
       const rows = [];
       const seen = new Set();
-      const allEls = [...modal.querySelectorAll("*")];
-      allEls.forEach((el) => {
+      [...modal.querySelectorAll("*")].forEach((el) => {
         if (el.children.length > 0) return;
         const text = el.innerText?.trim();
         if (!text) return;
         const isRate = /^\d+(\.\d+)?%$/.test(text) ||
                        /^(flat\s+)?(rs\.?\s*|₹)\s*\d+/i.test(text);
         if (!isRate) return;
-        const parent = el.parentElement;
-        const siblings = [...(parent?.children || [])];
-        const idx = siblings.indexOf(el);
-        const desc = siblings[idx + 1]?.innerText?.trim() || "";
+        const siblings = [...(el.parentElement?.children || [])];
+        const desc = siblings[siblings.indexOf(el) + 1]?.innerText?.trim() || "";
         if (desc.length > 3) {
           const key = `${text}|${desc}`;
           if (!seen.has(key)) { seen.add(key); rows.push({ rate: text, description: desc }); }
@@ -276,10 +255,13 @@ async function processStore(context, storeName, idx, total) {
       });
       return rows;
     }, usedSel);
-
     console.log(`  ✓ Profit rows: ${profitRates.length}`);
 
-    // Click Offer Details
+    // Full height screenshot of profit rates tab
+    const profitBuf = await fullModalScreenshot(modalEl, page);
+    console.log(`  ✓ Profit screenshot: ${profitBuf.length} bytes`);
+
+    // ── Tab 2: OFFER DETAILS ──
     let offerText = "";
     let offerBuf = null;
     try {
@@ -288,25 +270,30 @@ async function processStore(context, storeName, idx, total) {
         await offerTab.click();
         await delay(800);
         offerText = await page.evaluate((sel) => {
-          let modal;
-          if (sel === "text-based") {
-            modal = [...document.querySelectorAll("*")].find(el =>
-              el.innerText?.includes("OFFER DETAILS") &&
-              window.getComputedStyle(el).position !== "static"
-            );
-          } else {
-            modal = document.querySelector(sel);
-          }
-          return modal?.innerText?.trim() || "";
+          const modal = sel === "text-based"
+            ? [...document.querySelectorAll("*")].find(el =>
+                el.innerText?.includes("OFFER DETAILS") &&
+                window.getComputedStyle(el).position !== "static")
+            : document.querySelector(sel);
+          // Clean up the text — remove tab labels and header noise
+          return (modal?.innerText || "")
+            .split("\n")
+            .map(l => l.trim())
+            .filter(l => l.length > 0)
+            .filter(l => !["PROFIT RATES", "OFFER DETAILS", "×",
+                           "Share", "Today", "Get", "Orders",
+                           "Profit Tracks In"].includes(l))
+            .join("\n");
         }, usedSel);
         console.log(`  ✓ Offer text: ${offerText.length} chars`);
-        offerBuf = await modalEl.screenshot({ type: "png" });
+        offerBuf = await fullModalScreenshot(modalEl, page);
+        console.log(`  ✓ Offer screenshot: ${offerBuf.length} bytes`);
       }
     } catch (e) {
       console.warn(`  ⚠ Offer tab: ${e.message}`);
     }
 
-    // Upload screenshots
+    // ── Upload to storage ──
     const profitPath = `${slug}/${today}_profit_rates.png`;
     const { error: e1 } = await supabase.storage.from(BUCKET)
       .upload(profitPath, profitBuf, { contentType: "image/png", upsert: true });
@@ -322,7 +309,7 @@ async function processStore(context, storeName, idx, total) {
       else console.log(`  ✓ Offer uploaded`);
     }
 
-    // DB upsert
+    // ── Save to DB ──
     const { error: dbErr } = await supabase.from("snapshots").upsert({
       retailer_name:    storeName,
       retailer_slug:    slug,
@@ -344,6 +331,7 @@ async function processStore(context, storeName, idx, total) {
   }
 }
 
+// ── MAIN ───────────────────────────────────────────────────────────────────
 async function main() {
   const browser = await chromium.launch({
     headless: true,
@@ -363,6 +351,7 @@ async function main() {
     if (!storeNames.length) throw new Error("No stores found");
     if (MAX_RETAILERS) storeNames = storeNames.slice(0, Number(MAX_RETAILERS));
 
+    console.log(`\n→ Processing ${storeNames.length} stores...\n`);
     for (let i = 0; i < storeNames.length; i++) {
       try {
         await Promise.race([
