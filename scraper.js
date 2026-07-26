@@ -1,13 +1,15 @@
 /**
- * EarnKaro StoreKaro Scraper - Final Production Version
- * - Scrapes profit rates + offer details as TEXT daily
- * - Stores logo once per retailer (never re-downloads)
- * - No screenshots — text only saves storage
- * - Fresh page per store, 45s timeout per store
+ * EarnKaro StoreKaro Scraper - v2 (change-detecting, direct-nav)
+ * - Reads data-id for every store from /stores (no modal clicking)
+ * - Visits earnkaro.com/stores/<data-id> directly
+ * - Captures: short_description (hero block) + profit_rates + offer_details + logo
+ * - Only INSERTS a new row when content changed vs the last stored snapshot
+ * - change_index is per-retailer, per-IST-day (1st change, 2nd change, ...)
  */
 
 import { chromium } from "playwright";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 import ws from "ws";
 
 const {
@@ -29,16 +31,24 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   realtime: { transport: ws },
 });
 
-const BUCKET      = "earnkaro";
-const today       = new Date().toISOString().slice(0, 10);
+const BUCKET     = "earnkaro";
+const STORE_BASE = "https://earnkaro.com/stores";
+// captured_on grouped by IST day so "changes per day" matches your calendar
+const today      = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
-const delay       = (ms) => new Promise((res) => setTimeout(res, ms));
+const delay      = (ms) => new Promise((res) => setTimeout(res, ms));
 
 function slugify(input) {
   return input.toLowerCase().trim()
     .replace(/&/g, "and")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function hashOf(short_description, profit_rates, offer_details) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify({ short_description, profit_rates, offer_details }))
+    .digest("hex");
 }
 
 async function stealthPage(page) {
@@ -50,65 +60,9 @@ async function stealthPage(page) {
   });
 }
 
-// ── LOGO: store once, reuse forever ───────────────────────────────────────
-async function captureAndStoreLogo(page, storeName, slug) {
-  try {
-    // Check if logo already exists — never re-download
-    const { data: existing } = await supabase.storage
-      .from(BUCKET)
-      .list("logos", { search: `${slug}` });
-    if (existing && existing.length > 0) {
-      console.log(`  → Logo exists, skipping`);
-      return `logos/${existing[0].name}`;
-    }
-
-    // Find this store's logo src on the page
-    const logoUrl = await page.evaluate((targetName) => {
-      const btns = [...document.querySelectorAll("*")]
-        .filter(el => el.innerText?.trim().toUpperCase() === "VIEW PROFIT RATES");
-      for (const btn of btns) {
-        let node = btn.parentElement;
-        for (let j = 0; j < 8; j++) {
-          const img = node?.querySelector("img[alt]");
-          if (img?.alt?.trim().toLowerCase() === targetName.toLowerCase()) {
-            return img.src;
-          }
-          node = node?.parentElement;
-        }
-      }
-      return null;
-    }, storeName);
-
-    if (!logoUrl) { console.warn(`  ⚠ Logo not found`); return null; }
-
-    // Download and upload to Supabase
-    const response = await page.request.get(logoUrl);
-    if (!response.ok()) { console.warn(`  ⚠ Logo download failed`); return null; }
-
-    const buffer    = await response.body();
-    const ext       = logoUrl.includes(".svg") ? "svg" : "png";
-    const mimeType  = ext === "svg" ? "image/svg+xml" : "image/png";
-    const logoPath  = `logos/${slug}.${ext}`;
-
-    const { error } = await supabase.storage
-      .from(BUCKET)
-      .upload(logoPath, buffer, { contentType: mimeType, upsert: false });
-
-    if (error && !error.message.includes("already exists")) {
-      console.warn(`  ⚠ Logo upload failed: ${error.message}`);
-      return null;
-    }
-    console.log(`  ✓ Logo stored: ${logoPath}`);
-    return logoPath;
-  } catch (e) {
-    console.warn(`  ⚠ Logo error: ${e.message}`);
-    return null;
-  }
-}
-
-// ── LOGIN ──────────────────────────────────────────────────────────────────
+// -- LOGIN -------------------------------------------------------------------
 async function login(context) {
-  console.log("→ Logging in...");
+  console.log("-> Logging in...");
   const page = await context.newPage();
   await stealthPage(page);
   try {
@@ -124,214 +78,198 @@ async function login(context) {
     await delay(400);
     await page.click('button:has-text("Continue")');
     await page.waitForFunction(() => !window.location.href.includes("/login"), { timeout: 20000 });
-    console.log("✓ Logged in");
+    console.log("Logged in");
   } finally {
     await page.close();
   }
 }
 
-// ── COLLECT ALL STORE NAMES ────────────────────────────────────────────────
-async function collectStoreNames(context) {
+// -- COLLECT STORES: name + data-id + logo url (no clicking) -----------------
+async function collectStores(context) {
   const page = await context.newPage();
   await stealthPage(page);
   try {
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
     await delay(3000);
-    let prevHeight = 0;
+    let prev = 0;
     for (let i = 0; i < 40; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await delay(700);
       const h = await page.evaluate(() => document.body.scrollHeight);
-      if (h === prevHeight) break;
-      prevHeight = h;
+      if (h === prev) break;
+      prev = h;
     }
-    const names = await page.evaluate(() => {
-      const results = [];
-      document.querySelectorAll("*").forEach((el) => {
-        if (el.innerText?.trim().toUpperCase() !== "VIEW PROFIT RATES") return;
-        let node = el.parentElement;
-        for (let j = 0; j < 8; j++) {
-          const img = node?.querySelector("img[alt]");
-          if (img?.alt?.trim()) { results.push(img.alt.trim()); return; }
-          node = node?.parentElement;
+    const stores = await page.evaluate(() => {
+      const out = [];
+      const seen = new Set();
+      document.querySelectorAll("a.all_stores_more[data-id]").forEach((a) => {
+        const dataId = a.getAttribute("data-id");
+        if (!dataId || seen.has(dataId)) return;
+        let node = a.parentElement, name = "", logo = "";
+        for (let j = 0; j < 8 && node; j++) {
+          const img = node.querySelector("img[alt]");
+          if (img && img.alt.trim()) { name = img.alt.trim(); logo = img.src; break; }
+          node = node.parentElement;
         }
+        seen.add(dataId);
+        out.push({ dataId, name: name || dataId, logoUrl: logo });
       });
-      return [...new Set(results)];
+      return out;
     });
-    console.log(`✓ Found ${names.length} stores`);
-    return names;
+    console.log("Found " + stores.length + " stores");
+    return stores;
   } finally {
     await page.close();
   }
 }
 
-// ── FIND MODAL ELEMENT ─────────────────────────────────────────────────────
-async function findModalEl(page) {
-  const SELECTORS = [
-    "#streInforpp > div",
-    "[class*='popupOverlay'] > div",
-    "[role='dialog']",
-    "[class*='modal']:not([class*='backdrop'])",
-    "[class*='popup'] > div",
-  ];
-  for (const sel of SELECTORS) {
-    try {
-      const el  = await page.$(sel);
-      if (!el) continue;
-      const box = await el.boundingBox();
-      if (box && box.width > 200 && box.height > 100) {
-        console.log(`  ✓ Modal: ${sel}`);
-        return { el, sel };
-      }
-    } catch { /* try next */ }
-  }
-  // Text fallback
-  const handle = await page.evaluateHandle(() =>
-    [...document.querySelectorAll("*")].find(el => {
-      const s = window.getComputedStyle(el);
-      return el.innerText?.includes("PROFIT RATES") &&
-             el.innerText?.includes("OFFER DETAILS") &&
-             (s.position === "fixed" || s.position === "absolute") &&
-             el.getBoundingClientRect().width > 200;
-    }) || null
-  );
-  if (handle.asElement()) {
-    console.log("  ✓ Modal: text fallback");
-    return { el: handle.asElement(), sel: "text-based" };
-  }
-  return null;
+// -- LOGO: store once per data-id, reuse forever -----------------------------
+async function storeLogo(page, dataId, logoUrl) {
+  if (!logoUrl) return null;
+  try {
+    const { data: existing } = await supabase.storage.from(BUCKET).list("logos", { search: dataId });
+    if (existing && existing.length > 0) return "logos/" + existing[0].name;
+    const resp = await page.request.get(logoUrl);
+    if (!resp.ok()) return null;
+    const buf  = await resp.body();
+    const ext  = logoUrl.includes(".svg") ? "svg" : "png";
+    const path = "logos/" + dataId + "." + ext;
+    const { error } = await supabase.storage.from(BUCKET).upload(
+      path, buf, { contentType: ext === "svg" ? "image/svg+xml" : "image/png", upsert: false });
+    if (error && !/already exists/.test(error.message)) return null;
+    return path;
+  } catch { return null; }
 }
 
-// ── PROCESS ONE STORE ──────────────────────────────────────────────────────
-async function processStore(context, storeName, idx, total) {
-  const slug = slugify(storeName);
-  console.log(`\n[${idx}/${total}] ${storeName}`);
+// -- DETAIL PAGE EXTRACTORS --------------------------------------------------
+// Hero block: the tagline lines shown under the logo (e.g. "You Earn Upto 8.2%...")
+async function extractDescription(page) {
+  return page.evaluate(() => {
+    const btn = [...document.querySelectorAll("*")]
+      .find((el) => el.children.length === 0 && /copy link/i.test(el.innerText || ""));
+    let card = btn;
+    for (let i = 0; i < 8 && card; i++) {
+      if (card.querySelector && card.querySelector("img")) break;
+      card = card.parentElement;
+    }
+    card = card || document.body;
+    const drop = /copy link|share now|see profit rates|^share$|^get$|^orders$|profit tracks in|^today$|^\d+\s*(hour|day|minute)s?$/i;
+    const lines = (card.innerText || "").split("\n").map((s) => s.trim())
+      .filter(Boolean).filter((l) => !drop.test(l));
+    return [...new Set(lines)].join(" | ");
+  });
+}
+
+async function extractRates(page) {
+  try {
+    const link = await page.$("text=See Profit Rates");
+    if (link) { await link.click(); await delay(1200); }
+  } catch { /* ignore */ }
+  return page.evaluate(() => {
+    const rows = [];
+    const seen = new Set();
+    [...document.querySelectorAll("*")].forEach((el) => {
+      if (el.children.length > 0) return;
+      const text = el.innerText?.trim();
+      if (!text) return;
+      const isRate = /^\d+(\.\d+)?%$/.test(text) || /^(flat\s+)?(rs\.?\s*|₹)\s*\d+/i.test(text);
+      if (!isRate) return;
+      const sib  = [...(el.parentElement?.children || [])];
+      const desc = sib[sib.indexOf(el) + 1]?.innerText?.trim() || "";
+      if (desc.length > 3) {
+        const k = text + "|" + desc;
+        if (!seen.has(k)) { seen.add(k); rows.push({ rate: text, description: desc }); }
+      }
+    });
+    return rows;
+  });
+}
+
+async function extractOffer(page) {
+  return page.evaluate(() => {
+    const hdr = [...document.querySelectorAll("*")]
+      .find((el) => el.children.length === 0 && /^offer details$/i.test((el.innerText || "").trim()));
+    if (!hdr) return "";
+    let sec = hdr;
+    for (let i = 0; i < 6; i++) {
+      if (sec.parentElement && sec.parentElement.innerText.length > hdr.innerText.length * 3) sec = sec.parentElement;
+      else break;
+    }
+    return (sec.innerText || "").split("\n").map((s) => s.trim())
+      .filter(Boolean).filter((l) => !/^offer details$/i.test(l)).join("\n");
+  });
+}
+
+// -- PROCESS ONE STORE -------------------------------------------------------
+async function processStore(context, store, idx, total) {
+  const { dataId, name, logoUrl } = store;
+  const slug = slugify(name);
+  const url  = STORE_BASE + "/" + dataId;
+  console.log("\n[" + idx + "/" + total + "] " + name + " -> " + url);
   const page = await context.newPage();
   await stealthPage(page);
 
   try {
-    await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageTimeout });
     await delay(2500);
 
-    // ── Find and click VIEW PROFIT RATES button ──
-    let found = false;
-    for (let attempt = 0; attempt < 30 && !found; attempt++) {
-      const btn = await page.evaluateHandle((name) => {
-        const btns = [...document.querySelectorAll("*")]
-          .filter(el => el.innerText?.trim().toUpperCase() === "VIEW PROFIT RATES");
-        for (const btn of btns) {
-          let node = btn.parentElement;
-          for (let j = 0; j < 8; j++) {
-            const img = node?.querySelector("img[alt]");
-            if (img?.alt?.trim().toLowerCase() === name.toLowerCase()) return btn;
-            node = node?.parentElement;
-          }
-        }
-        return null;
-      }, storeName);
+    const logoPath          = await storeLogo(page, dataId, logoUrl);
+    const short_description = await extractDescription(page);
+    const profit_rates      = await extractRates(page);
+    const offer_details     = await extractOffer(page);
 
-      if (btn.asElement()) {
-        // Capture logo while we have page loaded (before modal opens)
-        const logoPath = await captureAndStoreLogo(page, storeName, slug);
-        await btn.asElement().scrollIntoViewIfNeeded();
-        await delay(600);
-        await btn.asElement().click();
-        found = true;
-
-        await delay(2000);
-
-        // ── Find modal ──
-        const modal = await findModalEl(page);
-        if (!modal) { console.error("  ✗ Modal not found"); return; }
-        const { sel } = modal;
-
-        // ── Extract PROFIT RATES ──
-        const profitRates = await page.evaluate((sel) => {
-          const modal = sel === "text-based"
-            ? [...document.querySelectorAll("*")].find(el =>
-                el.innerText?.includes("PROFIT RATES") &&
-                window.getComputedStyle(el).position !== "static")
-            : document.querySelector(sel);
-          if (!modal) return [];
-          const rows = [];
-          const seen = new Set();
-          [...modal.querySelectorAll("*")].forEach((el) => {
-            if (el.children.length > 0) return;
-            const text = el.innerText?.trim();
-            if (!text) return;
-            const isRate = /^\d+(\.\d+)?%$/.test(text) ||
-                           /^(flat\s+)?(rs\.?\s*|₹)\s*\d+/i.test(text);
-            if (!isRate) return;
-            const siblings = [...(el.parentElement?.children || [])];
-            const desc = siblings[siblings.indexOf(el) + 1]?.innerText?.trim() || "";
-            if (desc.length > 3) {
-              const key = `${text}|${desc}`;
-              if (!seen.has(key)) { seen.add(key); rows.push({ rate: text, description: desc }); }
-            }
-          });
-          return rows;
-        }, sel);
-        console.log(`  ✓ Profit rows: ${profitRates.length}`);
-
-        // ── Extract OFFER DETAILS ──
-        let offerText = "";
-        try {
-          const offerTab = await page.$("text=OFFER DETAILS");
-          if (offerTab) {
-            await offerTab.click();
-            await delay(800);
-            offerText = await page.evaluate((sel) => {
-              const modal = sel === "text-based"
-                ? [...document.querySelectorAll("*")].find(el =>
-                    el.innerText?.includes("OFFER DETAILS") &&
-                    window.getComputedStyle(el).position !== "static")
-                : document.querySelector(sel);
-              return (modal?.innerText || "")
-                .split("\n")
-                .map(l => l.trim())
-                .filter(l => l.length > 0)
-                .filter(l => !["PROFIT RATES", "OFFER DETAILS", "×",
-                               "Share", "Today", "Get", "Orders",
-                               "Profit Tracks In"].includes(l))
-                .join("\n");
-            }, sel);
-            console.log(`  ✓ Offer text: ${offerText.length} chars`);
-          }
-        } catch (e) {
-          console.warn(`  ⚠ Offer tab: ${e.message}`);
-        }
-
-        // ── Save to DB ──
-        const { error: dbErr } = await supabase.from("snapshots").upsert({
-          retailer_name:    storeName,
-          retailer_slug:    slug,
-          profit_rates:     profitRates,
-          offer_details:    offerText,
-          logo_path:        logoPath,
-          image_path:       null,
-          offer_image_path: null,
-          captured_on:      today,
-          updated_at:       new Date().toISOString(),
-        }, { onConflict: "retailer_slug,captured_on" });
-
-        if (dbErr) console.error(`  ✗ DB: ${dbErr.message}`);
-        else console.log(`  ✓ Saved to DB ✓`);
-
-      } else {
-        await page.evaluate(() => window.scrollBy(0, 600));
-        await delay(500);
-      }
+    // Guard: empty extraction usually means a failed load - never record it as a "change"
+    if (!short_description && profit_rates.length === 0 && !offer_details) {
+      console.warn("  ! Empty extraction - skipping (probable load failure)");
+      return;
     }
-    if (!found) console.error("  ✗ Button not found");
 
+    const hash = hashOf(short_description, profit_rates, offer_details);
+
+    const { data: last } = await supabase
+      .from("snapshots")
+      .select("content_hash")
+      .eq("data_id", dataId)
+      .order("captured_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (last && last.content_hash === hash) {
+      console.log("  = No change - skipped");
+      return;
+    }
+
+    const { count } = await supabase
+      .from("snapshots")
+      .select("*", { count: "exact", head: true })
+      .eq("data_id", dataId)
+      .eq("captured_on", today);
+    const change_index = (count || 0) + 1;
+
+    const { error } = await supabase.from("snapshots").insert({
+      retailer_name:     name,
+      retailer_slug:     slug,
+      data_id:           dataId,
+      short_description: short_description,
+      profit_rates:      profit_rates,
+      offer_details:     offer_details,
+      logo_path:         logoPath,
+      content_hash:      hash,
+      captured_on:       today,
+      captured_at:       new Date().toISOString(),
+      change_index:      change_index,
+    });
+
+    if (error) console.error("  x DB: " + error.message);
+    else console.log("  + Change #" + change_index + " saved (rates:" + profit_rates.length + ")");
   } catch (err) {
-    console.error(`  ✗ Exception: ${err.message}`);
+    console.error("  x Exception: " + err.message);
   } finally {
     await page.close();
   }
 }
 
-// ── MAIN ───────────────────────────────────────────────────────────────────
+// -- MAIN --------------------------------------------------------------------
 async function main() {
   const browser = await chromium.launch({
     headless: true,
@@ -346,22 +284,22 @@ async function main() {
   });
   try {
     await login(context);
-    let storeNames = await collectStoreNames(context);
-    if (!storeNames.length) throw new Error("No stores found");
-    if (MAX_RETAILERS) storeNames = storeNames.slice(0, Number(MAX_RETAILERS));
+    let stores = await collectStores(context);
+    if (!stores.length) throw new Error("No stores found");
+    if (MAX_RETAILERS) stores = stores.slice(0, Number(MAX_RETAILERS));
 
-    console.log(`\n→ Processing ${storeNames.length} stores...\n`);
-    for (let i = 0; i < storeNames.length; i++) {
+    console.log("\n-> Processing " + stores.length + " stores (IST day " + today + ")...\n");
+    for (let i = 0; i < stores.length; i++) {
       try {
         await Promise.race([
-          processStore(context, storeNames[i], i + 1, storeNames.length),
+          processStore(context, stores[i], i + 1, stores.length),
           new Promise((_, rej) => setTimeout(() => rej(new Error("45s timeout")), 45000)),
         ]);
       } catch (err) {
-        console.error(`  ✗ Skipped: ${err.message}`);
+        console.error("  x Skipped: " + err.message);
       }
     }
-    console.log("\n✓ All done");
+    console.log("\nAll done");
   } finally {
     await context.close();
     await browser.close();
