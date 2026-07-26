@@ -295,6 +295,18 @@ async function processStore(context, store, idx, total) {
   }
 }
 
+// -- CONCURRENCY POOL (speed only; per-store work unchanged) ------------------
+async function runPool(items, worker, concurrency) {
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const idx = next++;
+      await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(lanes);
+}
+
 // -- MAIN --------------------------------------------------------------------
 async function main() {
   const browser = await chromium.launch({
@@ -308,23 +320,32 @@ async function main() {
     locale:     "en-US",
     timezoneId: "Asia/Kolkata",
   });
+
+  // Speed: drop heavy assets we never read. CSS/JS stay on; page.request
+  // (used for logo download) is NOT affected by routing.
+  await context.route("**/*", (route) => {
+    const t = route.request().resourceType();
+    if (t === "image" || t === "media" || t === "font") return route.abort();
+    return route.continue();
+  });
   try {
     await login(context);
     let stores = await collectStores(context);
     if (!stores.length) throw new Error("No stores found");
     if (MAX_RETAILERS) stores = stores.slice(0, Number(MAX_RETAILERS));
 
-    console.log("\n-> Processing " + stores.length + " stores (IST day " + today + ")...\n");
-    for (let i = 0; i < stores.length; i++) {
+    const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
+    console.log("\n-> Processing " + stores.length + " stores (IST day " + today + ") x" + CONCURRENCY + " ...\n");
+    await runPool(stores, async (store, i) => {
       try {
         await Promise.race([
-          processStore(context, stores[i], i + 1, stores.length),
+          processStore(context, store, i + 1, stores.length),
           new Promise((_, rej) => setTimeout(() => rej(new Error("45s timeout")), 45000)),
         ]);
       } catch (err) {
         console.error("  x Skipped: " + err.message);
       }
-    }
+    }, CONCURRENCY);
     console.log("\nAll done");
   } finally {
     await context.close();
