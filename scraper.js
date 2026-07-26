@@ -1,10 +1,20 @@
 /**
- * EarnKaro StoreKaro Scraper - v2 (change-detecting, direct-nav)
- * - Reads data-id for every store from /stores (no modal clicking)
- * - Visits earnkaro.com/stores/<data-id> directly
- * - Captures: short_description (hero block) + profit_rates + offer_details + logo
- * - Only INSERTS a new row when content changed vs the last stored snapshot
- * - change_index is per-retailer, per-IST-day (1st change, 2nd change, ...)
+ * EarnKaro StoreKaro Scraper - v3 (reads __NEXT_DATA__, change-detecting)
+ *
+ * FIX vs v2: store list is read from the page's embedded __NEXT_DATA__ JSON
+ * (props.pageProps.allStores.data) instead of walking the DOM for
+ * a.all_stores_more[data-id]. Every store's slug = attributes.unique_identifier.
+ * This is deterministic and returns all ~274 stores without scrolling.
+ *
+ * Detail-page extractors now use the real CSS classes seen in the page source
+ * (.store_description, .store_off_details, .cshbackst-value/.cshbackst-data)
+ * with heuristic fallbacks.
+ *
+ * DB columns used (all present after migration.sql):
+ *   retailer_name, retailer_slug, data_id, description, profit_rates,
+ *   offer_details, logo_path, content_hash, captured_on, captured_at
+ * Change number for the frontend is derived from row order (captured_at ASC),
+ * so no change_index / short_description columns are needed.
  */
 
 import { chromium } from "playwright";
@@ -20,6 +30,7 @@ const {
   PAGE_TIMEOUT_MS   = "30000",
   MAX_RETAILERS,
   START_URL         = "https://earnkaro.com/stores",
+  STORE_BASE        = "https://earnkaro.com/stores",
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -31,24 +42,24 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   realtime: { transport: ws },
 });
 
-const BUCKET     = "earnkaro";
-const STORE_BASE = "https://earnkaro.com/stores";
-// captured_on grouped by IST day so "changes per day" matches your calendar
-const today      = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+const BUCKET      = "earnkaro";
+const today       = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10); // IST day
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
-const delay      = (ms) => new Promise((res) => setTimeout(res, ms));
+const delay       = (ms) => new Promise((res) => setTimeout(res, ms));
 
 function slugify(input) {
-  return input.toLowerCase().trim()
-    .replace(/&/g, "and")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return (input || "").toLowerCase().trim()
+    .replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-function hashOf(short_description, profit_rates, offer_details) {
-  return crypto.createHash("sha256")
-    .update(JSON.stringify({ short_description, profit_rates, offer_details }))
-    .digest("hex");
+function hashOf(description, profit_rates, offer_details) {
+  const canonical = JSON.stringify({
+    description:  (description || "").replace(/\s+/g, " ").trim(),
+    profit_rates: (profit_rates || [])
+                    .map((r) => `${r.rate}|${(r.description || "").replace(/\s+/g, " ").trim()}`).sort(),
+    offer_details:(offer_details || "").replace(/\s+/g, " ").trim(),
+  });
+  return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
 async function stealthPage(page) {
@@ -84,38 +95,49 @@ async function login(context) {
   }
 }
 
-// -- COLLECT STORES: name + data-id + logo url (no clicking) -----------------
+// -- COLLECT STORES FROM __NEXT_DATA__ (deterministic) -----------------------
 async function collectStores(context) {
   const page = await context.newPage();
   await stealthPage(page);
   try {
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: pageTimeout });
-    await delay(3000);
-    let prev = 0;
-    for (let i = 0; i < 40; i++) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await delay(700);
-      const h = await page.evaluate(() => document.body.scrollHeight);
-      if (h === prev) break;
-      prev = h;
-    }
-    const stores = await page.evaluate(() => {
-      const out = [];
-      const seen = new Set();
-      document.querySelectorAll("a.all_stores_more[data-id]").forEach((a) => {
-        const dataId = a.getAttribute("data-id");
-        if (!dataId || seen.has(dataId)) return;
-        let node = a.parentElement, name = "", logo = "";
-        for (let j = 0; j < 8 && node; j++) {
-          const img = node.querySelector("img[alt]");
-          if (img && img.alt.trim()) { name = img.alt.trim(); logo = img.src; break; }
-          node = node.parentElement;
-        }
-        seen.add(dataId);
-        out.push({ dataId, name: name || dataId, logoUrl: logo });
-      });
-      return out;
+    await delay(1500);
+
+    let stores = await page.evaluate(() => {
+      const el = document.getElementById("__NEXT_DATA__");
+      if (!el) return [];
+      let json;
+      try { json = JSON.parse(el.textContent); } catch { return []; }
+      const arr = json?.props?.pageProps?.allStores?.data || [];
+      return arr.map((s) => ({
+        dataId:   s?.attributes?.unique_identifier,
+        name:     s?.attributes?.name,
+        logoUrl:  s?.attributes?.image_url,
+        headline: s?.attributes?.cashback_button_text || "",
+      })).filter((s) => s.dataId && s.name);
     });
+
+    // Fallback: DOM anchors, only if __NEXT_DATA__ was empty
+    if (!stores.length) {
+      console.warn("  ! __NEXT_DATA__ empty - falling back to DOM anchors");
+      stores = await page.evaluate(() => {
+        const out = [], seen = new Set();
+        document.querySelectorAll("a.all_stores_more[data-id]").forEach((a) => {
+          const dataId = a.getAttribute("data-id");
+          if (!dataId || seen.has(dataId)) return;
+          let node = a.parentElement, name = "", logo = "";
+          for (let j = 0; j < 8 && node; j++) {
+            const img = node.querySelector("img[alt]");
+            if (img && img.alt.trim()) { name = img.alt.trim(); logo = img.src; break; }
+            node = node.parentElement;
+          }
+          seen.add(dataId);
+          out.push({ dataId, name: name || dataId, logoUrl: logo, headline: "" });
+        });
+        return out;
+      });
+    }
+
     console.log("Found " + stores.length + " stores");
     return stores;
   } finally {
@@ -132,68 +154,80 @@ async function storeLogo(page, dataId, logoUrl) {
     const resp = await page.request.get(logoUrl);
     if (!resp.ok()) return null;
     const buf  = await resp.body();
-    const ext  = logoUrl.includes(".svg") ? "svg" : "png";
+    const ext  = /\.svg(\?|$)/i.test(logoUrl) ? "svg" : /\.jpe?g(\?|$)/i.test(logoUrl) ? "jpg" : "png";
     const path = "logos/" + dataId + "." + ext;
-    const { error } = await supabase.storage.from(BUCKET).upload(
-      path, buf, { contentType: ext === "svg" ? "image/svg+xml" : "image/png", upsert: false });
-    if (error && !/already exists/.test(error.message)) return null;
+    const mime = ext === "svg" ? "image/svg+xml" : ext === "jpg" ? "image/jpeg" : "image/png";
+    const { error } = await supabase.storage.from(BUCKET).upload(path, buf, { contentType: mime, upsert: false });
+    if (error && !/already exists/i.test(error.message)) return null;
     return path;
   } catch { return null; }
 }
 
-// -- DETAIL PAGE EXTRACTORS --------------------------------------------------
-// Hero block: the tagline lines shown under the logo (e.g. "You Earn Upto 8.2%...")
+// -- DETAIL PAGE EXTRACTORS (real classes, heuristic fallback) ---------------
 async function extractDescription(page) {
   return page.evaluate(() => {
-    const btn = [...document.querySelectorAll("*")]
-      .find((el) => el.children.length === 0 && /copy link/i.test(el.innerText || ""));
-    let card = btn;
-    for (let i = 0; i < 8 && card; i++) {
-      if (card.querySelector && card.querySelector("img")) break;
-      card = card.parentElement;
+    const el = document.querySelector(".store_description") ||
+               document.querySelector(".storetop_right");
+    if (el && el.innerText.trim()) {
+      return el.innerText.split("\n").map((s) => s.trim()).filter(Boolean).join(" | ");
     }
-    card = card || document.body;
-    const drop = /copy link|share now|see profit rates|^share$|^get$|^orders$|profit tracks in|^today$|^\d+\s*(hour|day|minute)s?$/i;
-    const lines = (card.innerText || "").split("\n").map((s) => s.trim())
-      .filter(Boolean).filter((l) => !drop.test(l));
-    return [...new Set(lines)].join(" | ");
+    // fallback: hero block above the COPY LINK button
+    const btn = [...document.querySelectorAll("*")]
+      .find((e) => e.children.length === 0 && /copy link/i.test(e.innerText || ""));
+    let card = btn;
+    for (let i = 0; i < 6 && card; i++) card = card.parentElement;
+    if (!card) return "";
+    return (card.innerText || "").split("\n").map((s) => s.trim())
+      .filter(Boolean).filter((l) => !/copy link|share now/i.test(l)).join(" | ");
   });
 }
 
 async function extractRates(page) {
-  try {
-    const link = await page.$("text=See Profit Rates");
-    if (link) { await link.click(); await delay(1200); }
-  } catch { /* ignore */ }
+  // open the profit-rates view if it's behind a toggle
+  for (const sel of ['text=See Profit Rates', '.store_profit a', 'text=VIEW PROFIT RATES']) {
+    try { const t = await page.$(sel); if (t) { await t.click(); await delay(1000); break; } } catch { /* next */ }
+  }
   return page.evaluate(() => {
-    const rows = [];
-    const seen = new Set();
+    // primary: EarnKaro rate list rows
+    let rows = [...document.querySelectorAll(".streinfovalwrp li, .store_pops_trk_dtls li")].map((li) => ({
+      rate: (li.querySelector(".cshbackst-value")?.innerText || "").trim(),
+      description: (li.querySelector(".cshbackst-data")?.innerText || "").trim(),
+    })).filter((r) => r.rate);
+    if (rows.length) return rows;
+
+    // fallback: regex over leaf nodes
+    const out = [], seen = new Set();
     [...document.querySelectorAll("*")].forEach((el) => {
       if (el.children.length > 0) return;
-      const text = el.innerText?.trim();
+      const text = (el.innerText || "").trim();
       if (!text) return;
       const isRate = /^\d+(\.\d+)?%$/.test(text) || /^(flat\s+)?(rs\.?\s*|₹)\s*\d+/i.test(text);
       if (!isRate) return;
-      const sib  = [...(el.parentElement?.children || [])];
-      const desc = sib[sib.indexOf(el) + 1]?.innerText?.trim() || "";
-      if (desc.length > 3) {
-        const k = text + "|" + desc;
-        if (!seen.has(k)) { seen.add(k); rows.push({ rate: text, description: desc }); }
-      }
+      const sib = [...(el.parentElement?.children || [])];
+      const desc = (sib[sib.indexOf(el) + 1]?.innerText || "").trim();
+      if (desc.length > 3) { const k = text + "|" + desc; if (!seen.has(k)) { seen.add(k); out.push({ rate: text, description: desc }); } }
     });
-    return rows;
+    return out;
   });
 }
 
 async function extractOffer(page) {
+  // ensure the Offer Details tab/section is shown
+  try { const t = await page.$("text=OFFER DETAILS") || await page.$("text=Offer Details"); if (t) { await t.click(); await delay(700); } } catch { /* ignore */ }
   return page.evaluate(() => {
+    const el = document.querySelector(".store_off_details") ||
+               document.querySelector(".storeinfo_off_dtls_in") ||
+               document.querySelector(".store_off_details_wrp");
+    if (el && el.innerText.trim()) {
+      return el.innerText.split("\n").map((s) => s.trim())
+        .filter(Boolean).filter((l) => !/^offer details$/i.test(l)).join("\n");
+    }
     const hdr = [...document.querySelectorAll("*")]
-      .find((el) => el.children.length === 0 && /^offer details$/i.test((el.innerText || "").trim()));
+      .find((e) => e.children.length === 0 && /^offer details$/i.test((e.innerText || "").trim()));
     if (!hdr) return "";
     let sec = hdr;
     for (let i = 0; i < 6; i++) {
-      if (sec.parentElement && sec.parentElement.innerText.length > hdr.innerText.length * 3) sec = sec.parentElement;
-      else break;
+      if (sec.parentElement && sec.parentElement.innerText.length > hdr.innerText.length * 3) sec = sec.parentElement; else break;
     }
     return (sec.innerText || "").split("\n").map((s) => s.trim())
       .filter(Boolean).filter((l) => !/^offer details$/i.test(l)).join("\n");
@@ -211,20 +245,20 @@ async function processStore(context, store, idx, total) {
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageTimeout });
-    await delay(2500);
+    await delay(2200);
 
-    const logoPath          = await storeLogo(page, dataId, logoUrl);
-    const short_description = await extractDescription(page);
-    const profit_rates      = await extractRates(page);
-    const offer_details     = await extractOffer(page);
+    const logoPath      = await storeLogo(page, dataId, logoUrl);
+    const description   = await extractDescription(page);
+    const profit_rates  = await extractRates(page);
+    const offer_details = await extractOffer(page);
+    console.log("  rates:" + profit_rates.length + " offer:" + offer_details.length + "c desc:" + description.length + "c");
 
-    // Guard: empty extraction usually means a failed load - never record it as a "change"
-    if (!short_description && profit_rates.length === 0 && !offer_details) {
+    if (!description && profit_rates.length === 0 && !offer_details) {
       console.warn("  ! Empty extraction - skipping (probable load failure)");
       return;
     }
 
-    const hash = hashOf(short_description, profit_rates, offer_details);
+    const hash = hashOf(description, profit_rates, offer_details);
 
     const { data: last } = await supabase
       .from("snapshots")
@@ -239,29 +273,21 @@ async function processStore(context, store, idx, total) {
       return;
     }
 
-    const { count } = await supabase
-      .from("snapshots")
-      .select("*", { count: "exact", head: true })
-      .eq("data_id", dataId)
-      .eq("captured_on", today);
-    const change_index = (count || 0) + 1;
-
     const { error } = await supabase.from("snapshots").insert({
-      retailer_name:     name,
-      retailer_slug:     slug,
-      data_id:           dataId,
-      short_description: short_description,
-      profit_rates:      profit_rates,
-      offer_details:     offer_details,
-      logo_path:         logoPath,
-      content_hash:      hash,
-      captured_on:       today,
-      captured_at:       new Date().toISOString(),
-      change_index:      change_index,
+      retailer_name: name,
+      retailer_slug: slug,
+      data_id:       dataId,
+      description:   description,
+      profit_rates:  profit_rates,
+      offer_details: offer_details,
+      logo_path:     logoPath,
+      content_hash:  hash,
+      captured_on:   today,
+      captured_at:   new Date().toISOString(),
     });
 
     if (error) console.error("  x DB: " + error.message);
-    else console.log("  + Change #" + change_index + " saved (rates:" + profit_rates.length + ")");
+    else console.log("  + CHANGE saved (rates:" + profit_rates.length + ")");
   } catch (err) {
     console.error("  x Exception: " + err.message);
   } finally {
