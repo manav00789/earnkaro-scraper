@@ -1,32 +1,22 @@
-name: Daily Retailer Scrape
-
+name: 3-Hourly Retailer Scrape
 on:
   schedule:
-    - cron: '0 2 * * *'   # 2:00 AM UTC = 7:30 AM IST
+    - cron: '0 */3 * * *'   # every 3 hours, on the hour (UTC)
   workflow_dispatch:
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Install ImageMagick (for stitching modal screenshots)
-        run: sudo apt-get install -y imagemagick
-
       - name: Install dependencies
         run: npm install
-
       - name: Install Playwright Browser
         run: npx playwright install chromium --with-deps
-
       - name: Run Scraper
         run: node scraper.js
         env:
@@ -34,7 +24,6 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EARNKARO_EMAIL: ${{ secrets.EARNKARO_EMAIL }}
           EARNKARO_PASSWORD: ${{ secrets.EARNKARO_PASSWORD }}
-
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
