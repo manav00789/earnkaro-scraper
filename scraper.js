@@ -1,12 +1,13 @@
 /**
- * EarnKaro StoreKaro Scraper - v4 (pause detection + change-detection)
+ * EarnKaro StoreKaro Scraper - v4 (pause detection via retailer_name + Flipkart exception)
  *
- * New in v4: Detects paused stores by comparing current __NEXT_DATA__ list
- * against all historical data_ids in the DB. If a store was captured before
- * but is no longer in the listing, it's marked as paused.
+ * New in v4: 
+ * - Detects paused stores by comparing current __NEXT_DATA__ list against all historical
+ *   retailer_names in the DB (works for both old NULL data_id and new captures)
+ * - Flipkart exception: if any Flipkart variant is still active, don't mark others as paused
  *
  * Everything else (direct store-page navigation, description capture,
- * change detection via content hash) is unchanged from v3.
+ * change detection via content hash, concurrency) unchanged from v3.
  */
 
 import { chromium } from "playwright";
@@ -87,7 +88,7 @@ async function login(context) {
   }
 }
 
-// -- COLLECT STORES (with pause detection) -----------------------------------
+// -- COLLECT STORES (with pause detection via retailer_name) ----------------
 async function collectStores(context) {
   const page = await context.newPage();
   await stealthPage(page);
@@ -111,24 +112,37 @@ async function collectStores(context) {
 
     console.log("Found " + stores.length + " stores");
     
-    // -- PAUSE DETECTION: compare current list to historical DB ---
+    // -- PAUSE DETECTION: compare current names to historical retailer_names ---
     const { data: allHistorical } = await supabase
       .from("snapshots")
-      .select("data_id")
-      .not("data_id", "is", null);
+      .select("retailer_name, retailer_slug, data_id")
+      .not("retailer_name", "is", null);
     
-    const historicalIds = new Set((allHistorical || []).map(r => r.data_id));
-    const currentIds = new Set(stores.map(s => s.dataId));
+    const historicalNames = new Set((allHistorical || []).map(r => r.retailer_name));
+    const currentNames = new Set(stores.map(s => s.name));
     
-    const pausedIds = [...historicalIds].filter(id => !currentIds.has(id));
-    if (pausedIds.length > 0) {
-      console.log("\n⏸  " + pausedIds.length + " stores paused (no longer in listing)\n");
+    const pausedNames = [...historicalNames].filter(name => {
+      // Flipkart exception: if any Flipkart variant is active, keep all as active
+      if (name.toLowerCase().includes("flipkart")) {
+        const hasActiveFlipkart = currentNames.some(n => n.toLowerCase().includes("flipkart"));
+        if (hasActiveFlipkart) {
+          console.log("  ✓ " + name + " (Flipkart variant, brand still active)");
+          return false;
+        }
+      }
       
-      for (const pausedId of pausedIds) {
+      // Normal: paused if in history but not in current list
+      return !currentNames.has(name);
+    });
+
+    if (pausedNames.length > 0) {
+      console.log("\n⏸  " + pausedNames.length + " stores paused (no longer in listing)\n");
+      
+      for (const pausedName of pausedNames) {
         const { data: last } = await supabase
           .from("snapshots")
-          .select("retailer_name, retailer_slug")
-          .eq("data_id", pausedId)
+          .select("retailer_name, retailer_slug, data_id")
+          .eq("retailer_name", pausedName)
           .order("captured_at", { ascending: false })
           .limit(1)
           .maybeSingle();
@@ -137,7 +151,7 @@ async function collectStores(context) {
           const { error } = await supabase.from("snapshots").insert({
             retailer_name: last.retailer_name,
             retailer_slug: last.retailer_slug,
-            data_id: pausedId,
+            data_id: last.data_id,  // preserve data_id if exists (may be null for old captures)
             description: null,
             profit_rates: [],
             offer_details: null,
