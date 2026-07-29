@@ -1,20 +1,12 @@
 /**
- * EarnKaro StoreKaro Scraper - v3 (reads __NEXT_DATA__, change-detecting)
+ * EarnKaro StoreKaro Scraper - v4 (pause detection + change-detection)
  *
- * FIX vs v2: store list is read from the page's embedded __NEXT_DATA__ JSON
- * (props.pageProps.allStores.data) instead of walking the DOM for
- * a.all_stores_more[data-id]. Every store's slug = attributes.unique_identifier.
- * This is deterministic and returns all ~274 stores without scrolling.
+ * New in v4: Detects paused stores by comparing current __NEXT_DATA__ list
+ * against all historical data_ids in the DB. If a store was captured before
+ * but is no longer in the listing, it's marked as paused.
  *
- * Detail-page extractors now use the real CSS classes seen in the page source
- * (.store_description, .store_off_details, .cshbackst-value/.cshbackst-data)
- * with heuristic fallbacks.
- *
- * DB columns used (all present after migration.sql):
- *   retailer_name, retailer_slug, data_id, description, profit_rates,
- *   offer_details, logo_path, content_hash, captured_on, captured_at
- * Change number for the frontend is derived from row order (captured_at ASC),
- * so no change_index / short_description columns are needed.
+ * Everything else (direct store-page navigation, description capture,
+ * change detection via content hash) is unchanged from v3.
  */
 
 import { chromium } from "playwright";
@@ -43,7 +35,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const BUCKET      = "earnkaro";
-const today       = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10); // IST day
+const today       = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
 const delay       = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -95,7 +87,7 @@ async function login(context) {
   }
 }
 
-// -- COLLECT STORES FROM __NEXT_DATA__ (deterministic) -----------------------
+// -- COLLECT STORES (with pause detection) -----------------------------------
 async function collectStores(context) {
   const page = await context.newPage();
   await stealthPage(page);
@@ -117,35 +109,56 @@ async function collectStores(context) {
       })).filter((s) => s.dataId && s.name);
     });
 
-    // Fallback: DOM anchors, only if __NEXT_DATA__ was empty
-    if (!stores.length) {
-      console.warn("  ! __NEXT_DATA__ empty - falling back to DOM anchors");
-      stores = await page.evaluate(() => {
-        const out = [], seen = new Set();
-        document.querySelectorAll("a.all_stores_more[data-id]").forEach((a) => {
-          const dataId = a.getAttribute("data-id");
-          if (!dataId || seen.has(dataId)) return;
-          let node = a.parentElement, name = "", logo = "";
-          for (let j = 0; j < 8 && node; j++) {
-            const img = node.querySelector("img[alt]");
-            if (img && img.alt.trim()) { name = img.alt.trim(); logo = img.src; break; }
-            node = node.parentElement;
-          }
-          seen.add(dataId);
-          out.push({ dataId, name: name || dataId, logoUrl: logo, headline: "" });
-        });
-        return out;
-      });
+    console.log("Found " + stores.length + " stores");
+    
+    // -- PAUSE DETECTION: compare current list to historical DB ---
+    const { data: allHistorical } = await supabase
+      .from("snapshots")
+      .select("data_id")
+      .not("data_id", "is", null);
+    
+    const historicalIds = new Set((allHistorical || []).map(r => r.data_id));
+    const currentIds = new Set(stores.map(s => s.dataId));
+    
+    const pausedIds = [...historicalIds].filter(id => !currentIds.has(id));
+    if (pausedIds.length > 0) {
+      console.log("\n⏸  " + pausedIds.length + " stores paused (no longer in listing)\n");
+      
+      for (const pausedId of pausedIds) {
+        const { data: last } = await supabase
+          .from("snapshots")
+          .select("retailer_name, retailer_slug")
+          .eq("data_id", pausedId)
+          .order("captured_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        
+        if (last) {
+          const { error } = await supabase.from("snapshots").insert({
+            retailer_name: last.retailer_name,
+            retailer_slug: last.retailer_slug,
+            data_id: pausedId,
+            description: null,
+            profit_rates: [],
+            offer_details: null,
+            logo_path: null,
+            status: "paused",
+            captured_at: new Date().toISOString(),
+          });
+          
+          if (error) console.error("  x Pause record failed: " + error.message);
+          else console.log("  ⏸  Recorded pause: " + last.retailer_name);
+        }
+      }
     }
 
-    console.log("Found " + stores.length + " stores");
     return stores;
   } finally {
     await page.close();
   }
 }
 
-// -- LOGO: store once per data-id, reuse forever -----------------------------
+// -- LOGO: store once per data-id, reuse forever ----------------------------
 async function storeLogo(page, dataId, logoUrl) {
   if (!logoUrl) return null;
   try {
@@ -163,7 +176,7 @@ async function storeLogo(page, dataId, logoUrl) {
   } catch { return null; }
 }
 
-// -- DETAIL PAGE EXTRACTORS (real classes, heuristic fallback) ---------------
+// -- DETAIL PAGE EXTRACTORS --------------------------------------------------
 async function extractDescription(page) {
   return page.evaluate(() => {
     const el = document.querySelector(".store_description") ||
@@ -171,7 +184,6 @@ async function extractDescription(page) {
     if (el && el.innerText.trim()) {
       return el.innerText.split("\n").map((s) => s.trim()).filter(Boolean).join(" | ");
     }
-    // fallback: hero block above the COPY LINK button
     const btn = [...document.querySelectorAll("*")]
       .find((e) => e.children.length === 0 && /copy link/i.test(e.innerText || ""));
     let card = btn;
@@ -183,19 +195,16 @@ async function extractDescription(page) {
 }
 
 async function extractRates(page) {
-  // open the profit-rates view if it's behind a toggle
   for (const sel of ['text=See Profit Rates', '.store_profit a', 'text=VIEW PROFIT RATES']) {
     try { const t = await page.$(sel); if (t) { await t.click(); await delay(1000); break; } } catch { /* next */ }
   }
   return page.evaluate(() => {
-    // primary: EarnKaro rate list rows
     let rows = [...document.querySelectorAll(".streinfovalwrp li, .store_pops_trk_dtls li")].map((li) => ({
       rate: (li.querySelector(".cshbackst-value")?.innerText || "").trim(),
       description: (li.querySelector(".cshbackst-data")?.innerText || "").trim(),
     })).filter((r) => r.rate);
     if (rows.length) return rows;
 
-    // fallback: regex over leaf nodes
     const out = [], seen = new Set();
     [...document.querySelectorAll("*")].forEach((el) => {
       if (el.children.length > 0) return;
@@ -212,7 +221,6 @@ async function extractRates(page) {
 }
 
 async function extractOffer(page) {
-  // ensure the Offer Details tab/section is shown
   try { const t = await page.$("text=OFFER DETAILS") || await page.$("text=Offer Details"); if (t) { await t.click(); await delay(700); } } catch { /* ignore */ }
   return page.evaluate(() => {
     const el = document.querySelector(".store_off_details") ||
@@ -239,7 +247,7 @@ async function processStore(context, store, idx, total) {
   const { dataId, name, logoUrl } = store;
   const slug = slugify(name);
   const url  = STORE_BASE + "/" + dataId;
-  console.log("\n[" + idx + "/" + total + "] " + name + " -> " + url);
+  console.log("[" + idx + "/" + total + "] " + name + " -> " + url);
   const page = await context.newPage();
   await stealthPage(page);
 
@@ -254,7 +262,7 @@ async function processStore(context, store, idx, total) {
     console.log("  rates:" + profit_rates.length + " offer:" + offer_details.length + "c desc:" + description.length + "c");
 
     if (!description && profit_rates.length === 0 && !offer_details) {
-      console.warn("  ! Empty extraction - skipping (probable load failure)");
+      console.warn("  ! Empty extraction - skipping");
       return;
     }
 
@@ -276,18 +284,19 @@ async function processStore(context, store, idx, total) {
     const { error } = await supabase.from("snapshots").insert({
       retailer_name: name,
       retailer_slug: slug,
-      data_id:       dataId,
-      description:   description,
-      profit_rates:  profit_rates,
+      data_id: dataId,
+      description: description,
+      profit_rates: profit_rates,
       offer_details: offer_details,
-      logo_path:     logoPath,
-      content_hash:  hash,
-      captured_on:   today,
-      captured_at:   new Date().toISOString(),
+      logo_path: logoPath,
+      content_hash: hash,
+      status: "active",
+      captured_on: today,
+      captured_at: new Date().toISOString(),
     });
 
     if (error) console.error("  x DB: " + error.message);
-    else console.log("  + CHANGE saved (rates:" + profit_rates.length + ")");
+    else console.log("  + CHANGE saved");
   } catch (err) {
     console.error("  x Exception: " + err.message);
   } finally {
@@ -295,7 +304,7 @@ async function processStore(context, store, idx, total) {
   }
 }
 
-// -- CONCURRENCY POOL (speed only; per-store work unchanged) ------------------
+// -- CONCURRENCY POOL --------------------------------------------------------
 async function runPool(items, worker, concurrency) {
   let next = 0;
   const lanes = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
@@ -320,14 +329,13 @@ async function main() {
     locale:     "en-US",
     timezoneId: "Asia/Kolkata",
   });
-
-  // Speed: drop heavy assets we never read. CSS/JS stay on; page.request
-  // (used for logo download) is NOT affected by routing.
+  
   await context.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
     return route.continue();
   });
+
   try {
     await login(context);
     let stores = await collectStores(context);
@@ -336,6 +344,7 @@ async function main() {
 
     const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
     console.log("\n-> Processing " + stores.length + " stores (IST day " + today + ") x" + CONCURRENCY + " ...\n");
+    
     await runPool(stores, async (store, i) => {
       try {
         await Promise.race([
@@ -346,6 +355,7 @@ async function main() {
         console.error("  x Skipped: " + err.message);
       }
     }, CONCURRENCY);
+    
     console.log("\nAll done");
   } finally {
     await context.close();
