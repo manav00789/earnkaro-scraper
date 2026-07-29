@@ -124,7 +124,7 @@ async function collectStores(context) {
     const pausedNames = [...historicalNames].filter(name => {
       // Flipkart exception: if any Flipkart variant is active, keep all as active
       if (name.toLowerCase().includes("flipkart")) {
-        const hasActiveFlipkart = currentNames.some(n => n.toLowerCase().includes("flipkart"));
+        const hasActiveFlipkart = [...currentNames].some(n => n.toLowerCase().includes("flipkart"));
         if (hasActiveFlipkart) {
           console.log("  ✓ " + name + " (Flipkart variant, brand still active)");
           return false;
