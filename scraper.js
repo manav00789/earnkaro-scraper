@@ -1,13 +1,20 @@
 /**
- * EarnKaro StoreKaro Scraper - v4 (pause detection via retailer_name + Flipkart exception)
+ * EarnKaro StoreKaro Scraper - v3 (reads __NEXT_DATA__, change-detecting)
  *
- * New in v4: 
- * - Detects paused stores by comparing current __NEXT_DATA__ list against all historical
- *   retailer_names in the DB (works for both old NULL data_id and new captures)
- * - Flipkart exception: if any Flipkart variant is still active, don't mark others as paused
+ * FIX vs v2: store list is read from the page's embedded __NEXT_DATA__ JSON
+ * (props.pageProps.allStores.data) instead of walking the DOM for
+ * a.all_stores_more[data-id]. Every store's slug = attributes.unique_identifier.
+ * This is deterministic and returns all ~274 stores without scrolling.
  *
- * Everything else (direct store-page navigation, description capture,
- * change detection via content hash, concurrency) unchanged from v3.
+ * Detail-page extractors now use the real CSS classes seen in the page source
+ * (.store_description, .store_off_details, .cshbackst-value/.cshbackst-data)
+ * with heuristic fallbacks.
+ *
+ * DB columns used (all present after migration.sql):
+ *   retailer_name, retailer_slug, data_id, description, profit_rates,
+ *   offer_details, logo_path, content_hash, captured_on, captured_at
+ * Change number for the frontend is derived from row order (captured_at ASC),
+ * so no change_index / short_description columns are needed.
  */
 
 import { chromium } from "playwright";
@@ -36,7 +43,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const BUCKET      = "earnkaro";
-const today       = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+const today       = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10); // IST day
 const pageTimeout = Number(PAGE_TIMEOUT_MS);
 const delay       = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -88,7 +95,7 @@ async function login(context) {
   }
 }
 
-// -- COLLECT STORES (with pause detection via retailer_name) ----------------
+// -- COLLECT STORES FROM __NEXT_DATA__ (deterministic) -----------------------
 async function collectStores(context) {
   const page = await context.newPage();
   await stealthPage(page);
@@ -110,69 +117,35 @@ async function collectStores(context) {
       })).filter((s) => s.dataId && s.name);
     });
 
-    console.log("Found " + stores.length + " stores");
-    
-    // -- PAUSE DETECTION: compare current names to historical retailer_names ---
-    const { data: allHistorical } = await supabase
-      .from("snapshots")
-      .select("retailer_name, retailer_slug, data_id")
-      .not("retailer_name", "is", null);
-    
-    const historicalNames = new Set((allHistorical || []).map(r => r.retailer_name));
-    const currentNames = new Set(stores.map(s => s.name));
-    
-    const pausedNames = [...historicalNames].filter(name => {
-      // Flipkart exception: if any Flipkart variant is active, keep all as active
-      if (name.toLowerCase().includes("flipkart")) {
-        const hasActiveFlipkart = [...currentNames].some(n => n.toLowerCase().includes("flipkart"));
-        if (hasActiveFlipkart) {
-          console.log("  ✓ " + name + " (Flipkart variant, brand still active)");
-          return false;
-        }
-      }
-      
-      // Normal: paused if in history but not in current list
-      return !currentNames.has(name);
-    });
-
-    if (pausedNames.length > 0) {
-      console.log("\n⏸  " + pausedNames.length + " stores paused (no longer in listing)\n");
-      
-      for (const pausedName of pausedNames) {
-        const { data: last } = await supabase
-          .from("snapshots")
-          .select("retailer_name, retailer_slug, data_id")
-          .eq("retailer_name", pausedName)
-          .order("captured_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        
-        if (last) {
-          const { error } = await supabase.from("snapshots").insert({
-            retailer_name: last.retailer_name,
-            retailer_slug: last.retailer_slug,
-            data_id: last.data_id,  // preserve data_id if exists (may be null for old captures)
-            description: null,
-            profit_rates: [],
-            offer_details: null,
-            logo_path: null,
-            status: "paused",
-            captured_at: new Date().toISOString(),
-          });
-          
-          if (error) console.error("  x Pause record failed: " + error.message);
-          else console.log("  ⏸  Recorded pause: " + last.retailer_name);
-        }
-      }
+    // Fallback: DOM anchors, only if __NEXT_DATA__ was empty
+    if (!stores.length) {
+      console.warn("  ! __NEXT_DATA__ empty - falling back to DOM anchors");
+      stores = await page.evaluate(() => {
+        const out = [], seen = new Set();
+        document.querySelectorAll("a.all_stores_more[data-id]").forEach((a) => {
+          const dataId = a.getAttribute("data-id");
+          if (!dataId || seen.has(dataId)) return;
+          let node = a.parentElement, name = "", logo = "";
+          for (let j = 0; j < 8 && node; j++) {
+            const img = node.querySelector("img[alt]");
+            if (img && img.alt.trim()) { name = img.alt.trim(); logo = img.src; break; }
+            node = node.parentElement;
+          }
+          seen.add(dataId);
+          out.push({ dataId, name: name || dataId, logoUrl: logo, headline: "" });
+        });
+        return out;
+      });
     }
 
+    console.log("Found " + stores.length + " stores");
     return stores;
   } finally {
     await page.close();
   }
 }
 
-// -- LOGO: store once per data-id, reuse forever ----------------------------
+// -- LOGO: store once per data-id, reuse forever -----------------------------
 async function storeLogo(page, dataId, logoUrl) {
   if (!logoUrl) return null;
   try {
@@ -190,7 +163,7 @@ async function storeLogo(page, dataId, logoUrl) {
   } catch { return null; }
 }
 
-// -- DETAIL PAGE EXTRACTORS --------------------------------------------------
+// -- DETAIL PAGE EXTRACTORS (real classes, heuristic fallback) ---------------
 async function extractDescription(page) {
   return page.evaluate(() => {
     const el = document.querySelector(".store_description") ||
@@ -198,6 +171,7 @@ async function extractDescription(page) {
     if (el && el.innerText.trim()) {
       return el.innerText.split("\n").map((s) => s.trim()).filter(Boolean).join(" | ");
     }
+    // fallback: hero block above the COPY LINK button
     const btn = [...document.querySelectorAll("*")]
       .find((e) => e.children.length === 0 && /copy link/i.test(e.innerText || ""));
     let card = btn;
@@ -209,16 +183,19 @@ async function extractDescription(page) {
 }
 
 async function extractRates(page) {
+  // open the profit-rates view if it's behind a toggle
   for (const sel of ['text=See Profit Rates', '.store_profit a', 'text=VIEW PROFIT RATES']) {
     try { const t = await page.$(sel); if (t) { await t.click(); await delay(1000); break; } } catch { /* next */ }
   }
   return page.evaluate(() => {
+    // primary: EarnKaro rate list rows
     let rows = [...document.querySelectorAll(".streinfovalwrp li, .store_pops_trk_dtls li")].map((li) => ({
       rate: (li.querySelector(".cshbackst-value")?.innerText || "").trim(),
       description: (li.querySelector(".cshbackst-data")?.innerText || "").trim(),
     })).filter((r) => r.rate);
     if (rows.length) return rows;
 
+    // fallback: regex over leaf nodes
     const out = [], seen = new Set();
     [...document.querySelectorAll("*")].forEach((el) => {
       if (el.children.length > 0) return;
@@ -235,6 +212,7 @@ async function extractRates(page) {
 }
 
 async function extractOffer(page) {
+  // ensure the Offer Details tab/section is shown
   try { const t = await page.$("text=OFFER DETAILS") || await page.$("text=Offer Details"); if (t) { await t.click(); await delay(700); } } catch { /* ignore */ }
   return page.evaluate(() => {
     const el = document.querySelector(".store_off_details") ||
@@ -261,7 +239,7 @@ async function processStore(context, store, idx, total) {
   const { dataId, name, logoUrl } = store;
   const slug = slugify(name);
   const url  = STORE_BASE + "/" + dataId;
-  console.log("[" + idx + "/" + total + "] " + name + " -> " + url);
+  console.log("\n[" + idx + "/" + total + "] " + name + " -> " + url);
   const page = await context.newPage();
   await stealthPage(page);
 
@@ -276,7 +254,7 @@ async function processStore(context, store, idx, total) {
     console.log("  rates:" + profit_rates.length + " offer:" + offer_details.length + "c desc:" + description.length + "c");
 
     if (!description && profit_rates.length === 0 && !offer_details) {
-      console.warn("  ! Empty extraction - skipping");
+      console.warn("  ! Empty extraction - skipping (probable load failure)");
       return;
     }
 
@@ -298,19 +276,18 @@ async function processStore(context, store, idx, total) {
     const { error } = await supabase.from("snapshots").insert({
       retailer_name: name,
       retailer_slug: slug,
-      data_id: dataId,
-      description: description,
-      profit_rates: profit_rates,
+      data_id:       dataId,
+      description:   description,
+      profit_rates:  profit_rates,
       offer_details: offer_details,
-      logo_path: logoPath,
-      content_hash: hash,
-      status: "active",
-      captured_on: today,
-      captured_at: new Date().toISOString(),
+      logo_path:     logoPath,
+      content_hash:  hash,
+      captured_on:   today,
+      captured_at:   new Date().toISOString(),
     });
 
     if (error) console.error("  x DB: " + error.message);
-    else console.log("  + CHANGE saved");
+    else console.log("  + CHANGE saved (rates:" + profit_rates.length + ")");
   } catch (err) {
     console.error("  x Exception: " + err.message);
   } finally {
@@ -318,7 +295,7 @@ async function processStore(context, store, idx, total) {
   }
 }
 
-// -- CONCURRENCY POOL --------------------------------------------------------
+// -- CONCURRENCY POOL (speed only; per-store work unchanged) ------------------
 async function runPool(items, worker, concurrency) {
   let next = 0;
   const lanes = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
@@ -343,13 +320,14 @@ async function main() {
     locale:     "en-US",
     timezoneId: "Asia/Kolkata",
   });
-  
+
+  // Speed: drop heavy assets we never read. CSS/JS stay on; page.request
+  // (used for logo download) is NOT affected by routing.
   await context.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
     return route.continue();
   });
-
   try {
     await login(context);
     let stores = await collectStores(context);
@@ -358,7 +336,6 @@ async function main() {
 
     const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
     console.log("\n-> Processing " + stores.length + " stores (IST day " + today + ") x" + CONCURRENCY + " ...\n");
-    
     await runPool(stores, async (store, i) => {
       try {
         await Promise.race([
@@ -369,7 +346,6 @@ async function main() {
         console.error("  x Skipped: " + err.message);
       }
     }, CONCURRENCY);
-    
     console.log("\nAll done");
   } finally {
     await context.close();
