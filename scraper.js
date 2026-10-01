@@ -1,5 +1,5 @@
 /**
- * EarnKaro StoreKaro Scraper - v4 Final (pause detection with brand exceptions)
+ * EarnKaro StoreKaro Scraper - v4 Final (pause detection with brand exceptions)ss
  *
  * New in v4:
  * - Detects paused stores via retailer_name normalization
